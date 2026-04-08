@@ -280,8 +280,6 @@ def _build_num_microbatches_calculator(
                 'Cannot specify both --step-batch-size-schedule and '
                 '--decrease-batch-size-if-needed'
             )
-        if global_batch_size is not None and rank == 0:
-            logger.warning('--global-batch-size is ignored when using --step-batch-size-schedule')
         num_microbatches_calculator = StepBatchsizeNumMicroBatchesCalculator(
             micro_batch_size=micro_batch_size,
             data_parallel_size=data_parallel_size,

@@ -103,6 +103,13 @@ def validate_yaml(args, defaults={}):
     # Batch size.
     assert args.micro_batch_size is not None
     assert args.micro_batch_size > 0
+    explicit_global_batch_size = getattr(
+        args, '_explicit_global_batch_size', args.global_batch_size is not None
+    )
+    if args.step_batch_size_schedule is not None and explicit_global_batch_size:
+        raise ValueError(
+            'Cannot specify both --step-batch-size-schedule and --global-batch-size'
+        )
     if args.global_batch_size is None:
         args.global_batch_size = args.micro_batch_size * args.data_parallel_size
         if args.rank == 0:
@@ -421,5 +428,8 @@ def load_yaml(yaml_path):
         config_namespace = json.loads(json.dumps(config), object_hook=lambda item: SimpleNamespace(**item))
         # Add config location to namespace
         config_namespace.yaml_cfg = yaml_path
+        config_namespace._explicit_global_batch_size = (
+            getattr(config_namespace, "global_batch_size", None) is not None
+        )
         return config_namespace
 
