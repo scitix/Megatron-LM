@@ -65,6 +65,10 @@ class AttnBackend(enum.Enum):
     unfused = 3
     local = 4
     auto = 5
+    # Tree-attention backend: routes through TETreeDotProductAttention which
+    # consumes ``packed_seq_params.tree_metadata`` and calls the FA3 tree
+    # kernel. ``cp_size == 1`` is required.
+    tree = 6
 
 
 class CudaGraphScope(enum.Enum):

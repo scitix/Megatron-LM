@@ -30,7 +30,7 @@ from megatron.core.utils import deprecate_inference_params, internal_api
 logger = logging.getLogger(__name__)
 
 
-__all__ = ['RotaryEmbedding', 'MultimodalRotaryEmbedding']
+__all__ = ['RotaryEmbedding', 'MultimodalRotaryEmbedding', 'TreePackedRotaryEmbedding']
 
 
 class RotaryEmbedding(nn.Module):
@@ -362,3 +362,58 @@ class MultimodalRotaryEmbedding(nn.Module):
             # CP rank
             emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
         return emb
+
+
+class TreePackedRotaryEmbedding(RotaryEmbedding):
+    """RoPE for packed THD sequences whose tokens carry tree-aware position ids.
+
+    A varlen packed sequence has physical position ``i`` matching the intended
+    pos_id ``i``, so the stock ``RotaryEmbedding.forward`` returns ``emb`` with
+    ``emb[i]`` being the freqs row that ``apply_rotary_pos_emb`` will rotate
+    row ``i`` of the packed q/k tensor with — physically and intentionally
+    aligned.
+
+    For a tree-packed sequence, every leaf after the first lives at a physical
+    offset that is shifted by the total length of preceding siblings (plus the
+    shared-prefix node), so row ``i`` should instead be rotated by the freqs
+    that correspond to the **logical** pos_id of the token at physical row
+    ``i``. This subclass performs that gather inside ``forward`` so the TE
+    apply path can stay completely untouched (``apply_rotary_pos_emb`` remains
+    a pure elementwise operation).
+
+    The gather is gated on ``packed_seq_params.tree_metadata`` being set, so
+    the same instance can serve both varlen and tree micro-batches without
+    branching at the call site.
+    """
+
+    def forward(
+        self,
+        max_seq_len: int,
+        offset: int = 0,
+        packed_seq_params: Optional["PackedSeqParams"] = None,
+    ) -> Tensor:
+        emb = super().forward(max_seq_len, offset=offset, packed_seq_params=packed_seq_params)
+        tree_md = (
+            packed_seq_params.tree_metadata if packed_seq_params is not None else None
+        )
+        if tree_md is None:
+            return emb
+
+        pos = tree_md.tree_position_ids
+        pos_flat = pos.squeeze(0) if pos.dim() == 2 else pos
+        if pos_flat.device != emb.device:
+            pos_flat = pos_flat.to(emb.device)
+
+        # Safety: positions must fall within emb's first axis. If max_seq_len
+        # was undersized the caller should fix get_rotary_seq_len rather than
+        # silently truncate.
+        if pos_flat.numel() > 0:
+            max_pos = int(pos_flat.max().item())
+            if max_pos >= emb.shape[0]:
+                raise RuntimeError(
+                    f"TreePackedRotaryEmbedding: tree position_id {max_pos} "
+                    f"exceeds emb table length {emb.shape[0]}; rotary_seq_len "
+                    f"must be >= max(tree_position_ids) + 1."
+                )
+
+        return emb[pos_flat]
