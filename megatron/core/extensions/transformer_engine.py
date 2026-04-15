@@ -1161,64 +1161,16 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         )
 
 
-class _FA3TreeAttnFunc(torch.autograd.Function):
-    """Autograd wrapper for the FA3 tree attention kernel.
-
-    The kernel itself lives in the FA3 wheel (``flash_attn_interface``); this
-    wrapper saves the inputs needed for the corresponding backward kernel and
-    keeps the precomputed tree metadata dict alive across the forward / backward
-    boundary. Once ``scitix/TransformerEngine`` ships ``TreeFlashAttention`` in
-    a TE wheel, the wrapper here can be removed and the attention call
-    delegated to TE's dispatch instead.
-    """
-
-    @staticmethod
-    def forward(ctx, q, k, v, cu_node_lens, node_parent, softmax_scale, precomputed):
-        # Lazy import: the FA3 wheel is only required when tree training is on,
-        # so do not pay the import cost in non-tree runs.
-        from flash_attn_interface import flash_attn_tree_func
-
-        out, lse = flash_attn_tree_func(
-            q, k, v, cu_node_lens, node_parent,
-            softmax_scale=softmax_scale,
-            tree_metadata=precomputed,
-        )
-        ctx.save_for_backward(q, k, v, out, lse, cu_node_lens, node_parent)
-        ctx.softmax_scale = softmax_scale
-        ctx.precomputed = precomputed
-        return out
-
-    @staticmethod
-    def backward(ctx, dout):
-        from flash_attn_interface import flash_attn_tree_bwd_func
-
-        q, k, v, out, lse, cu_node_lens, node_parent = ctx.saved_tensors
-        dq, dk, dv = flash_attn_tree_bwd_func(
-            dout, q, k, v, out, lse,
-            cu_node_lens, node_parent,
-            softmax_scale=ctx.softmax_scale,
-            tree_metadata=ctx.precomputed,
-        )
-        return dq, dk, dv, None, None, None, None
-
-
 class TETreeDotProductAttention(TEDotProductAttention):
     """Tree-attention variant of TEDotProductAttention.
 
-    Routes ``packed_seq_params.tree_metadata`` into the FA3 tree kernel and
-    bypasses TE's normal dispatch chain. Forces ``qkv_format='thd'`` and
-    requires ``cp_size == 1`` (CP support is Stage 2 of the migration plan).
-
-    The class chains ``__init__`` to ``TEDotProductAttention`` so it inherits
-    the heavyweight TE setup that downstream Megatron paths rely on (rng
-    tracker, tp/cp groups, etc.) — this matters for any non-tree micro-batch
-    that flows through the same instance, even though the tree forward path
-    here ignores it.
-
-    Until ``scitix/TransformerEngine`` ships ``TreeFlashAttention`` in a TE
-    wheel, ``forward`` calls ``_FA3TreeAttnFunc`` directly (via the FA3 wheel).
-    Once TE has the native backend, replace the direct kernel call with a TE
-    backend dispatch.
+    Thin subclass that enforces the tree preconditions
+    (``cp_size == 1``, self-attention only, ``qkv_format='thd'``) and
+    unpacks ``packed_seq_params.tree_metadata`` into the
+    ``tree_cu_node_lens`` / ``tree_node_parent`` / ``tree_precomputed``
+    kwargs on ``DotProductAttention.forward``. All real work happens in
+    TE's ``TreeFlashAttention`` backend, which is selected by the TE
+    dispatch layer when these kwargs are present.
     """
 
     def __init__(
@@ -1259,7 +1211,6 @@ class TETreeDotProductAttention(TEDotProductAttention):
         )
         # Force THD: tree micro-batches are always packed.
         self.qkv_format = "thd"
-        self.tree_softmax_scale = softmax_scale
 
     def forward(
         self,
@@ -1271,12 +1222,6 @@ class TETreeDotProductAttention(TEDotProductAttention):
         attention_bias: Tensor = None,
         packed_seq_params: PackedSeqParams = None,
     ):
-        """Tree-attention forward path.
-
-        Inputs are ``[S, B, H, D]`` with ``B == 1`` for tree training. Returns
-        ``[S, B, H * D]`` to match TE's output convention so the rest of the
-        Megatron transformer block does not branch.
-        """
         tree_md = (
             packed_seq_params.tree_metadata if packed_seq_params is not None else None
         )
@@ -1286,27 +1231,27 @@ class TETreeDotProductAttention(TEDotProductAttention):
                 "packed_seq_params.tree_metadata. The tree spec was selected "
                 "but the data iterator did not populate tree metadata."
             )
-        # attention_mask is unused in the tree path; the trie topology lives in
-        # tree_md. attn_mask_type / attention_bias are similarly ignored.
-        del attention_mask, attn_mask_type, attention_bias
-
-        # [S, B, H, D] -> [B, S, H, D]; B == 1 so the permute is a no-copy view.
-        q = query.permute(1, 0, 2, 3).contiguous()
-        k = key.permute(1, 0, 2, 3).contiguous()
-        v = value.permute(1, 0, 2, 3).contiguous()
-
-        output = _FA3TreeAttnFunc.apply(
-            q, k, v,
-            tree_md.cu_node_lens,
-            tree_md.node_parent,
-            self.tree_softmax_scale,
-            tree_md.precomputed,
+        # Tree path bypasses the Megatron-side TEDotProductAttention.forward
+        # wrapper (which would drop the tree_* kwargs it does not know about)
+        # and calls te.pytorch.DotProductAttention.forward directly. TE's own
+        # dispatch layer routes this to TreeFlashAttention based on the
+        # presence of the tree_* kwargs.
+        return te.pytorch.DotProductAttention.forward(
+            self,
+            query,
+            key,
+            value,
+            attention_mask=None,
+            qkv_format="thd",
+            cu_seqlens_q=packed_seq_params.cu_seqlens_q if packed_seq_params is not None else None,
+            cu_seqlens_kv=packed_seq_params.cu_seqlens_kv if packed_seq_params is not None else None,
+            max_seqlen_q=packed_seq_params.max_seqlen_q if packed_seq_params is not None else None,
+            max_seqlen_kv=packed_seq_params.max_seqlen_kv if packed_seq_params is not None else None,
+            attn_mask_type=attn_mask_type.name,
+            tree_cu_node_lens=tree_md.cu_node_lens,
+            tree_node_parent=tree_md.node_parent,
+            tree_precomputed=tree_md.precomputed,
         )
-
-        # [B, S, H, D] -> [S, B, H * D]
-        s, b = query.shape[0], query.shape[1]
-        output = output.permute(1, 0, 2, 3).contiguous().view(s, b, -1)
-        return output
 
 
 if HAVE_TE and is_te_min_version("1.9.0.dev0"):
