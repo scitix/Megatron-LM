@@ -205,6 +205,13 @@ class TopKRouter(Router):
         self.router_replay = None
         if self.config.moe_enable_routing_replay:
             self.router_replay = RouterReplay()
+        # SiRL adapter: also register with sirl's RoutingReplay for actor.py
+        # fill_routing_replay compatibility
+        try:
+            from sirl.utils.routing_replay import register_routing_replay
+            register_routing_replay(self)
+        except ImportError:
+            pass
 
     def _maintain_float32_expert_bias(self):
         """
