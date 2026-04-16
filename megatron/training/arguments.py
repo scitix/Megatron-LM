@@ -1681,14 +1681,8 @@ def _add_network_size_args(parser):
     group.add_argument('--make-vocab-size-divisible-by', type=int, default=128,
                        help='Pad the vocab size to be divisible by this value.'
                        'This is added for computational efficieny reasons.')
-    # normalization, apply-residual-connection-post-layernorm, post-self-attn-layernorm,
-    # post-mlp-layernorm are auto-registered by ArgumentGroupFactory(TransformerConfig).
-    # Only add args NOT in TransformerConfig:
-    group.add_argument('--norm-epsilon', type=float, default=1e-5,
-                       help='Epsilon for layer norm and RMS norm.')
-    group.add_argument('--apply-layernorm-1p', action='store_true',
-                       help='Adjust LayerNorm weights such that they are centered '
-                       'around zero. This improves numerical stability.')
+    # All slime-patch args that overlap with ArgumentGroupFactory(TransformerConfig)
+    # are removed. Only add args that are truly new:
     group.add_argument('--use-gated-attention', action='store_true',
                        help='If set, use gated attention as in Qwen3Next')
     group.add_argument('--openai-gelu', action='store_true',
