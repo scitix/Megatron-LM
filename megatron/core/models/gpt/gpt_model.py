@@ -482,6 +482,7 @@ class GPTModel(LanguageModule):
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
+        mtp_kwargs: Optional[dict] = {},
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -554,6 +555,7 @@ class GPTModel(LanguageModule):
             runtime_gather_output=runtime_gather_output,
             extra_block_kwargs=extra_block_kwargs,
             inference_context=inference_context,
+            mtp_kwargs=mtp_kwargs,
         )
 
     def _postprocess(
@@ -575,6 +577,7 @@ class GPTModel(LanguageModule):
         runtime_gather_output=None,
         extra_block_kwargs=None,
         inference_context=None,
+        mtp_kwargs={},
     ):
         """Postprocesses decoder hidden states to generate logits or compute loss.
 
@@ -589,7 +592,8 @@ class GPTModel(LanguageModule):
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
-        if mtp_in_postprocess:
+
+        if mtp_in_postprocess and mtp_kwargs.get('mtp_labels', None) is not None:
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -615,6 +619,9 @@ class GPTModel(LanguageModule):
             if loss_mask is None:
                 # if loss_mask is not provided, use all ones as loss_mask
                 loss_mask = torch.ones_like(mtp_labels)
+            else:
+                # Otherwise, roll the loss_mask to keep up with the mtp_labels
+                loss_mask, _ = roll_tensor(loss_mask, shifts=-1, dims=-1, cp_group=self.cp_group, packed_seq_params=packed_seq_params)
             for mtp_layer_number in range(self.config.mtp_num_layers):
                 # output
                 mtp_logits, _ = self.output_layer(
