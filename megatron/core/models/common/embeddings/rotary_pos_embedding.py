@@ -177,7 +177,11 @@ class RotaryEmbedding(nn.Module):
 
     @internal_api
     def forward(
-        self, max_seq_len: int, offset: int = 0, packed_seq_params: Optional[PackedSeqParams] = None
+        self,
+        max_seq_len: int,
+        offset: int = 0,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        position_ids: Optional[Tensor] = None,
     ) -> Tensor:
         """Forward pass of RoPE embedding.
 
@@ -185,6 +189,10 @@ class RotaryEmbedding(nn.Module):
             max_seq_len (int): Maximum size of sequence
             offset (int, optional): RoPE offset. Defaults to 0.
             packed_seq_params (PackedSeqParams, optional): Packed sequence params. Defaults to None.
+            position_ids (Tensor, optional): Per-token positional ids for
+                reindexing the emb table. When provided, ``emb[position_ids]``
+                is returned so each packed token gets the RoPE frequency for
+                its logical position. Defaults to None (sequential positions).
 
         Returns:
             Tensor: Embeddings after applying RoPE.
@@ -202,13 +210,8 @@ class RotaryEmbedding(nn.Module):
             # and select the parition of the current CP rank
             emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
 
-        # Custom per-token position ids: reindex emb so each packed token
-        # gets the RoPE frequency for its logical position rather than its
-        # physical offset in the packed tensor. Used by tree training and
-        # any future feature that needs non-sequential per-token positions.
-        if packed_seq_params is not None and packed_seq_params.position_ids is not None:
-            pos = packed_seq_params.position_ids
-            pos_flat = pos.squeeze(0) if pos.dim() == 2 else pos
+        if position_ids is not None:
+            pos_flat = position_ids.squeeze(0) if position_ids.dim() == 2 else position_ids
             if pos_flat.device != emb.device:
                 pos_flat = pos_flat.to(emb.device)
             if pos_flat.numel() > 0:

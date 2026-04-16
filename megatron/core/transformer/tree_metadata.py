@@ -31,8 +31,8 @@ class TreeMetadata:
         ``-1`` marks roots.
     tree_position_ids
         ``int64`` tensor of shape ``[total_tokens]`` — per-token positional id.
-        Copied to ``PackedSeqParams.position_ids`` by the data iterator so
-        ``RotaryEmbedding.forward`` can gather rope freqs generically.
+        Passed as ``position_ids`` through GPTModel.forward so
+        ``RotaryEmbedding.forward`` can gather rope freqs.
     padded_size
         Padded packed length (``cu_node_lens[-1]`` after padding).
     num_nodes
