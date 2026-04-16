@@ -1076,6 +1076,33 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 super().set_context_parallel_group(None, None, None, self.cp_comm_type)
             self.kept_packed_seq_params.discard("cp_group")
             self.kept_packed_seq_params.discard("local_cp_size")
+        # Tree-attention fast path: when packed_seq_params carries tree_metadata,
+        # bypass the normal varlen flow and delegate to TE's TreeFlashAttention
+        # backend via tree_* kwargs. This makes tree vs varlen data-driven —
+        # the same TEDotProductAttention instance handles both, no spec swap.
+        tree_md = (
+            packed_seq_params.tree_metadata
+            if packed_seq_params is not None
+            else None
+        )
+        if tree_md is not None:
+            return te.pytorch.DotProductAttention.forward(
+                self,
+                query,
+                key,
+                value,
+                attention_mask=None,
+                qkv_format="thd",
+                cu_seqlens_q=packed_seq_params.cu_seqlens_q,
+                cu_seqlens_kv=packed_seq_params.cu_seqlens_kv,
+                max_seqlen_q=packed_seq_params.max_seqlen_q,
+                max_seqlen_kv=packed_seq_params.max_seqlen_kv,
+                attn_mask_type=attn_mask_type.name,
+                tree_cu_node_lens=tree_md.cu_node_lens,
+                tree_node_parent=tree_md.node_parent,
+                tree_precomputed=tree_md.precomputed,
+            )
+
         packed_seq_kwargs = (
             {key: getattr(packed_seq_params, key) for key in self.kept_packed_seq_params}
             if packed_seq_params is not None
@@ -1160,98 +1187,6 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             dp_cp_group=metadata["dp_cp_group"],
         )
 
-
-class TETreeDotProductAttention(TEDotProductAttention):
-    """Tree-attention variant of TEDotProductAttention.
-
-    Thin subclass that enforces the tree preconditions
-    (``cp_size == 1``, self-attention only, ``qkv_format='thd'``) and
-    unpacks ``packed_seq_params.tree_metadata`` into the
-    ``tree_cu_node_lens`` / ``tree_node_parent`` / ``tree_precomputed``
-    kwargs on ``DotProductAttention.forward``. All real work happens in
-    TE's ``TreeFlashAttention`` backend, which is selected by the TE
-    dispatch layer when these kwargs are present.
-    """
-
-    def __init__(
-        self,
-        config: TransformerConfig,
-        layer_number: int,
-        attn_mask_type: AttnMaskType,
-        attention_type: str,
-        attention_dropout: Optional[float] = None,
-        softmax_scale: Optional[float] = None,
-        k_channels: Optional[int] = None,
-        v_channels: Optional[int] = None,
-        cp_comm_type: str = "p2p",
-        pg_collection: ProcessGroupCollection = None,
-    ):
-        if config.context_parallel_size != 1:
-            raise ValueError(
-                "TETreeDotProductAttention does not support context parallelism "
-                "(cp_size must be 1). CP support is tracked as Stage 2 of the "
-                "tree-training native migration."
-            )
-        if attention_type != "self":
-            raise ValueError(
-                "TETreeDotProductAttention only supports self-attention."
-            )
-
-        super().__init__(
-            config=config,
-            layer_number=layer_number,
-            attn_mask_type=attn_mask_type,
-            attention_type=attention_type,
-            attention_dropout=attention_dropout,
-            softmax_scale=softmax_scale,
-            k_channels=k_channels,
-            v_channels=v_channels,
-            cp_comm_type=cp_comm_type,
-            pg_collection=pg_collection,
-        )
-        # Force THD: tree micro-batches are always packed.
-        self.qkv_format = "thd"
-
-    def forward(
-        self,
-        query: Tensor,
-        key: Tensor,
-        value: Tensor,
-        attention_mask: Tensor,
-        attn_mask_type: AttnMaskType,
-        attention_bias: Tensor = None,
-        packed_seq_params: PackedSeqParams = None,
-    ):
-        tree_md = (
-            packed_seq_params.tree_metadata if packed_seq_params is not None else None
-        )
-        if tree_md is None:
-            raise RuntimeError(
-                "TETreeDotProductAttention.forward called without "
-                "packed_seq_params.tree_metadata. The tree spec was selected "
-                "but the data iterator did not populate tree metadata."
-            )
-        # Tree path bypasses the Megatron-side TEDotProductAttention.forward
-        # wrapper (which would drop the tree_* kwargs it does not know about)
-        # and calls te.pytorch.DotProductAttention.forward directly. TE's own
-        # dispatch layer routes this to TreeFlashAttention based on the
-        # presence of the tree_* kwargs.
-        return te.pytorch.DotProductAttention.forward(
-            self,
-            query,
-            key,
-            value,
-            attention_mask=None,
-            qkv_format="thd",
-            cu_seqlens_q=packed_seq_params.cu_seqlens_q if packed_seq_params is not None else None,
-            cu_seqlens_kv=packed_seq_params.cu_seqlens_kv if packed_seq_params is not None else None,
-            max_seqlen_q=packed_seq_params.max_seqlen_q if packed_seq_params is not None else None,
-            max_seqlen_kv=packed_seq_params.max_seqlen_kv if packed_seq_params is not None else None,
-            attn_mask_type=attn_mask_type.name,
-            tree_cu_node_lens=tree_md.cu_node_lens,
-            tree_node_parent=tree_md.node_parent,
-            tree_precomputed=tree_md.precomputed,
-        )
 
 
 if HAVE_TE and is_te_min_version("1.9.0.dev0"):

@@ -27,6 +27,7 @@ class PackedSeqParams:
     cp_group: dist.ProcessGroup = None
     # Tree-attention metadata for the native tree-training path. ``None`` for
     # all existing callers; populated by slime's TreeDataIterator when
-    # ``--enable-tree-training`` is on. Routed to TETreeDotProductAttention
-    # and TreePackedRotaryEmbedding. See megatron.core.transformer.tree_metadata.
+    # ``--enable-tree-training`` is on. TEDotProductAttention and
+    # RotaryEmbedding detect this field and route to the tree path
+    # automatically. See megatron.core.transformer.tree_metadata.
     tree_metadata: Optional["TreeMetadata"] = None
