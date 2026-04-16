@@ -1076,33 +1076,6 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 super().set_context_parallel_group(None, None, None, self.cp_comm_type)
             self.kept_packed_seq_params.discard("cp_group")
             self.kept_packed_seq_params.discard("local_cp_size")
-        # Tree-attention fast path: when packed_seq_params carries tree_metadata,
-        # bypass the normal varlen flow and delegate to TE's TreeFlashAttention
-        # backend via tree_* kwargs. This makes tree vs varlen data-driven —
-        # the same TEDotProductAttention instance handles both, no spec swap.
-        tree_md = (
-            packed_seq_params.tree_metadata
-            if packed_seq_params is not None
-            else None
-        )
-        if tree_md is not None:
-            return te.pytorch.DotProductAttention.forward(
-                self,
-                query,
-                key,
-                value,
-                attention_mask=None,
-                qkv_format="thd",
-                cu_seqlens_q=packed_seq_params.cu_seqlens_q,
-                cu_seqlens_kv=packed_seq_params.cu_seqlens_kv,
-                max_seqlen_q=packed_seq_params.max_seqlen_q,
-                max_seqlen_kv=packed_seq_params.max_seqlen_kv,
-                attn_mask_type=attn_mask_type.name,
-                tree_cu_node_lens=tree_md.cu_node_lens,
-                tree_node_parent=tree_md.node_parent,
-                tree_precomputed=tree_md.precomputed,
-            )
-
         packed_seq_kwargs = (
             {key: getattr(packed_seq_params, key) for key in self.kept_packed_seq_params}
             if packed_seq_params is not None
