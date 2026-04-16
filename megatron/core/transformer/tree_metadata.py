@@ -3,8 +3,9 @@
 
 Used by the tree-training native path to flow tree topology + precomputed FA3
 attention buffers + per-token positional ids from the data iterator through
-``PackedSeqParams.tree_metadata`` to ``TEDotProductAttention`` (tree fast
-path) and ``RotaryEmbedding`` (tree-position gather).
+``PackedSeqParams.tree_metadata`` to TE's ``TreeFlashAttention`` backend.
+The per-token positional ids are also copied to
+``PackedSeqParams.position_ids`` for ``RotaryEmbedding`` to consume.
 
 The dataclass is deliberately lightweight: torch is imported only for
 ``Tensor`` typing, no CUDA assumptions are made at definition time.
@@ -29,8 +30,9 @@ class TreeMetadata:
         ``int32`` tensor of shape ``[num_nodes]`` — parent index per trie node;
         ``-1`` marks roots.
     tree_position_ids
-        ``int64`` tensor of shape ``[total_tokens]`` — per-token positional id
-        used by ``RotaryEmbedding.forward`` to gather rope freqs.
+        ``int64`` tensor of shape ``[total_tokens]`` — per-token positional id.
+        Copied to ``PackedSeqParams.position_ids`` by the data iterator so
+        ``RotaryEmbedding.forward`` can gather rope freqs generically.
     padded_size
         Padded packed length (``cu_node_lens[-1]`` after padding).
     num_nodes

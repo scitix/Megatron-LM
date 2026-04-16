@@ -202,15 +202,12 @@ class RotaryEmbedding(nn.Module):
             # and select the parition of the current CP rank
             emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
 
-        # Tree-attention: reorder emb rows by tree_position_ids so each
-        # packed token gets the RoPE frequency for its logical position
-        # in the original sequence rather than its physical offset in the
-        # packed tensor. No-op when tree_metadata is absent (varlen path).
-        tree_md = (
-            packed_seq_params.tree_metadata if packed_seq_params is not None else None
-        )
-        if tree_md is not None:
-            pos = tree_md.tree_position_ids
+        # Custom per-token position ids: reindex emb so each packed token
+        # gets the RoPE frequency for its logical position rather than its
+        # physical offset in the packed tensor. Used by tree training and
+        # any future feature that needs non-sequential per-token positions.
+        if packed_seq_params is not None and packed_seq_params.position_ids is not None:
+            pos = packed_seq_params.position_ids
             pos_flat = pos.squeeze(0) if pos.dim() == 2 else pos
             if pos_flat.device != emb.device:
                 pos_flat = pos_flat.to(emb.device)
@@ -218,9 +215,9 @@ class RotaryEmbedding(nn.Module):
                 max_pos = int(pos_flat.max().item())
                 if max_pos >= emb.shape[0]:
                     raise RuntimeError(
-                        f"RotaryEmbedding: tree position_id {max_pos} exceeds "
+                        f"RotaryEmbedding: position_id {max_pos} exceeds "
                         f"emb table length {emb.shape[0]}; rotary_seq_len must "
-                        f"be >= max(tree_position_ids) + 1."
+                        f"be >= max(position_ids) + 1."
                     )
             emb = emb[pos_flat]
 
