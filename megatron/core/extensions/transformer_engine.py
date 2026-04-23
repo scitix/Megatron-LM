@@ -1161,7 +1161,6 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         )
 
 
-
 if HAVE_TE and is_te_min_version("1.9.0.dev0"):
     def ceil_div(x: int, y: int) -> int:
         return (x + y - 1) // y
