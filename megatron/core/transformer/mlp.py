@@ -101,12 +101,24 @@ class MLP(MegatronModule):
 
         # If this is a gated linear unit we double the output width
         # see https://arxiv.org/pdf/2002.05202.pdf
+        # For GLU/SwiGLU, TP shards store interleaved [gate, up] portions.
+        # Preserving stride=2 is required for correct checkpoint resharding.
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
+            fc1_stride = 2
+            if self.config.use_kitchen:
+                # Kitchen Linear doesn't support stride != 1.
+                fc1_stride = 1
+        else:
+            fc1_stride = 1
+
+        # Use moe_latent_size only for routed experts. Shared experts stay on
+        # hidden_size.
+        use_latent_size = (self.config.moe_latent_size is not None) and is_expert
 
         self.linear_fc1 = build_module(
             submodules.linear_fc1,
-            self.input_size,
+            self.input_size if not use_latent_size else self.config.moe_latent_size,
             ffn_hidden_size,
             config=self.config,
             init_method=self.config.init_method,
@@ -116,6 +128,7 @@ class MLP(MegatronModule):
             is_expert=is_expert,
             tp_comm_buffer_name="fc1",
             tp_group=tp_group,
+            stride=fc1_stride,
         )
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):
@@ -126,7 +139,7 @@ class MLP(MegatronModule):
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
             self.config.ffn_hidden_size,
-            self.config.hidden_size,
+            self.config.hidden_size if not use_latent_size else self.config.moe_latent_size,
             config=self.config,
             init_method=self.config.output_layer_init_method,
             bias=self.config.add_bias_linear,
