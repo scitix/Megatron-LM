@@ -180,6 +180,8 @@ class TopKRouter(Router):
 
         self._routing_mode_initialized = False
         self.enable_expert_bias = False
+        self.local_tokens_per_expert = None
+        self.expert_bias = None
         self.tid2eid = None
         self._frozen_expert_bias_snapshot = None
         self._routing_replay_registered = False
