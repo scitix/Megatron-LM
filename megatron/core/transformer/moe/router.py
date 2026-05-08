@@ -180,8 +180,6 @@ class TopKRouter(Router):
 
         self._routing_mode_initialized = False
         self.enable_expert_bias = False
-        self.local_tokens_per_expert = None
-        self.expert_bias = None
         self.tid2eid = None
         self._frozen_expert_bias_snapshot = None
         self._routing_replay_registered = False
@@ -236,7 +234,7 @@ class TopKRouter(Router):
         self.enable_expert_bias = (
             self.config.moe_router_enable_expert_bias and not mode_hash
         )
-        if self.enable_expert_bias and self.local_tokens_per_expert is None:
+        if self.enable_expert_bias and not hasattr(self, 'local_tokens_per_expert'):
             self.register_buffer(
                 'local_tokens_per_expert',
                 torch.zeros(
@@ -255,8 +253,8 @@ class TopKRouter(Router):
                 ),
             )
         elif not self.enable_expert_bias:
-            self.local_tokens_per_expert = None
-            self.expert_bias = None
+            self.register_buffer('local_tokens_per_expert', None, persistent=False)
+            self.register_buffer('expert_bias', None)
 
         if mode_hash:
             self.tid2eid = torch.nn.Parameter(
