@@ -644,11 +644,11 @@ def topk_routing_with_score_function(
         else:
             return torch.topk(scores, k=topk, dim=1)
 
-    from sirl.utils.routing_replay import get_routing_replay_compute_topk
+    from sirl.utils.replay_base import routing_replay_manager
     # MTP layers and hash-routed layers (tid2eid is not None) bypass replay
     # since MTP routing is non-standard and hash routing is deterministic.
     if not is_mtp and tid2eid is None:
-        compute_topk = get_routing_replay_compute_topk(compute_topk)
+        compute_topk = routing_replay_manager.get_topk_fn(compute_topk, return_probs=True)
 
     if score_function == "softmax":
         if use_pre_softmax:
