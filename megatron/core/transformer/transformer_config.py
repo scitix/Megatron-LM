@@ -171,6 +171,9 @@ class TransformerConfig(ModelParallelConfig):
     """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func
     is quick_gelu."""
 
+    activation_func_clamp_shared_expert: bool = True
+    """If False, shared experts ignore activation_func_clamp_value while routed experts keep it."""
+
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
     for no MoE."""
@@ -241,7 +244,7 @@ class TransformerConfig(ModelParallelConfig):
     # attention variant
     ####################
     experimental_attention_variant: Optional[str] = None
-    """Type of attention variant to use. Currently support gated_delta_net and dsa."""
+    """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4."""
 
     ####################
     # attention variant: gated_delta_net
@@ -290,6 +293,48 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_use_sparse_loss: Optional[bool] = None
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
+
+    ####################
+    # attention variant: DeepSeek-V4
+    ####################
+    dsv4_mode: bool = False
+    """Enable DeepSeek-V4 hyper-connection, routing, and sparse-attention shape semantics."""
+
+    dsv4_hc_mult: Optional[int] = None
+    """DeepSeek-V4 Hyper-Connection stream multiplier."""
+
+    dsv4_hc_sinkhorn_iters: int = 20
+    """DeepSeek-V4 Hyper-Connection Sinkhorn iterations."""
+
+    dsv4_hc_eps: float = 1e-6
+    """DeepSeek-V4 Hyper-Connection epsilon."""
+
+    dsv4_compress_ratios: Optional[List[int]] = None
+    """DeepSeek-V4 per-layer compression ratios."""
+
+    dsv4_compress_rope_theta: float = 40000.0
+    """DeepSeek-V4 compressor RoPE theta."""
+
+    dsv4_o_groups: Optional[int] = None
+    """DeepSeek-V4 grouped output projection group count."""
+
+    dsv4_o_lora_rank: Optional[int] = None
+    """DeepSeek-V4 output projection LoRA rank."""
+
+    dsv4_n_hash_layers: int = 0
+    """Number of initial DeepSeek-V4 layers using hash routing."""
+
+    dsv4_window_size: int = 4096
+    """DeepSeek-V4 local attention window size."""
+
+    freeze_e_score_correction_bias: bool = False
+    """Freeze MoE expert score correction bias during training."""
+
+    moe_router_freeze_gate: bool = False
+    """Freeze MoE router gate weights during training."""
+
+    vocab_size: Optional[int] = None
+    """Vocabulary size used to initialize DeepSeek-V4 hash-routing tables."""
 
     ####################
     # initialization
@@ -896,6 +941,9 @@ class TransformerConfig(ModelParallelConfig):
             )
             self.experimental_attention_variant = self.linear_attention_type
             self.linear_attention_type = None
+
+        if self.experimental_attention_variant == "dsv4":
+            self.dsv4_mode = True
 
         if self.experimental_attention_variant in ["gated_delta_net"]:
             assert (
@@ -1541,10 +1589,13 @@ class TransformerConfig(ModelParallelConfig):
                 self.expert_tensor_parallel_size == 1
             ), "Bias in Moe is only supported when ETP==1"
 
-        if self.moe_router_enable_expert_bias and self.moe_router_score_function != "sigmoid":
+        if self.moe_router_enable_expert_bias and self.moe_router_score_function not in (
+            "sigmoid",
+            "sqrtsoftplus",
+        ):
             raise ValueError(
-                "Expert bias for aux-loss-free routing only supports sigmoid score function."
-                "Please set --moe-router-score-function sigmoid for sigmoid score function."
+                "Expert bias for aux-loss-free routing only supports sigmoid or sqrtsoftplus score function. "
+                "Please set --moe-router-score-function to sigmoid or sqrtsoftplus."
             )
 
         if self.num_moe_experts and self.fp8:

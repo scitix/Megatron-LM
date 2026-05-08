@@ -1786,6 +1786,9 @@ def _add_network_size_args(parser):
     group.add_argument('--activation-func-clamp-value', type=float, default=None,
                        help='Clamp the output of the linear_fc1 in the activation function. Only used when '
                             'activation_func is quick_gelu.')
+    group.add_argument('--no-activation-func-clamp-shared-expert', action='store_false',
+                       dest='activation_func_clamp_shared_expert',
+                       help='Do not apply activation_func_clamp_value inside shared expert MLPs.')
     group.add_argument('--glu-linear-offset', type=float, default=0.0,
                        help='Offset term in the GLU activation function: activation_func(x[0]) * (x[1] + offset). '
                             'Only used when gated_linear_unit is True')
@@ -3238,9 +3241,9 @@ def _add_moe_args(parser):
     group.add_argument('--moe-router-fusion', action='store_true',
                        help='Enable fusion for MoE TopK routing and aux-loss computation. This is only supported in TransformerEngine 2.7.0 and above.')
     group.add_argument('--moe-router-score-function', type=str,
-                       choices=['softmax', 'sigmoid'],
+                       choices=['softmax', 'sigmoid', 'sqrtsoftplus'],
                        default='softmax',
-                       help='Score function for MoE TopK routing. Can be "softmax" or "sigmoid".')
+                       help='Score function for MoE TopK routing. Can be "softmax", "sigmoid", or "sqrtsoftplus".')
     group.add_argument('--moe-router-topk', type=int, default=2,
                        help='Number of experts to route to for each token. The default is 2.')
     group.add_argument('--moe-router-pre-softmax', action='store_true',
@@ -3256,6 +3259,10 @@ def _add_moe_args(parser):
                        help='TopK routing with dynamic expert bias in the aux-loss-free load balancing strategy. '
                        'The routing decision is based on the sum of the routing scores and the expert bias. '
                        'See https://arxiv.org/abs/2408.15664 for details.')
+    group.add_argument('--moe-router-freeze-gate', action='store_true',
+                       help='Freeze MoE router gate weights during training.')
+    group.add_argument('--freeze-e-score-correction-bias', action='store_true',
+                       help='Freeze MoE expert score correction bias during training.')
     group.add_argument('--moe-router-bias-update-rate', type=float, default=1e-3,
                        help='Expert bias update rate in the aux-loss-free load balancing strategy. '
                        'The expert bias is updated based on the number of assigned tokens to each expert in a global batch, '
@@ -3337,6 +3344,12 @@ def _add_mla_args(parser):
                        help="Dimension of the head in the V projection.")
     group.add_argument('--rotary-scaling-factor', type=float, default=1.0,
                        help="Rotary scaling factor for the rotary embeddings.")
+    group.add_argument('--original-max-position-embeddings', type=int, default=4096,
+                       help='Original maximum position embeddings for YaRN RoPE.')
+    group.add_argument('--beta-fast', type=float, default=32,
+                       help='YaRN beta fast.')
+    group.add_argument('--beta-slow', type=float, default=1,
+                       help='YaRN beta slow.')
     group.add_argument('--mscale', type=float, default=1.0,
                        help="Mscale for YaRN RoPE in multi-latent attention.")
     group.add_argument('--mscale-all-dim', type=float, default=0.0,
@@ -3348,8 +3361,8 @@ def _add_mla_args(parser):
 
 def _add_experimental_attention_variant_args(parser):
     group = parser.add_argument_group(title="experimental_attention_variant")
-    group.add_argument('--experimental-attention-variant', default=None, choices=['gated_delta_net', 'dsa'], type=str,
-                       help='Type of attention variant to use. Currently support gated_delta_net and dsa.')
+    group.add_argument('--experimental-attention-variant', default=None, choices=['gated_delta_net', 'dsa', 'dsv4'], type=str,
+                       help='Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4.')
 
     # Linear attention
     group.add_argument('--linear-attention-type', default=None, choices=['gated_delta_net'], type=str,
@@ -3385,6 +3398,26 @@ def _add_experimental_attention_variant_args(parser):
                        help='Coefficient for the indexer KL divergence loss. Set to 0 to disable indexer loss.')
     group.add_argument('--dsa-indexer-use-sparse-loss', action='store_true',
                        help='Use sparse indexer loss. If set, the indexer loss will be computed using the top-k indices.')
+
+    # DeepSeek-V4
+    group.add_argument('--dsv4-hc-mult', default=None, type=int,
+                       help='DeepSeek-V4 Hyper-Connection stream multiplier.')
+    group.add_argument('--dsv4-hc-sinkhorn-iters', default=20, type=int,
+                       help='DeepSeek-V4 Hyper-Connection Sinkhorn iterations.')
+    group.add_argument('--dsv4-hc-eps', default=1e-6, type=float,
+                       help='DeepSeek-V4 Hyper-Connection epsilon.')
+    group.add_argument('--dsv4-compress-ratios', nargs='+', default=None, type=int,
+                       help='DeepSeek-V4 per-layer compression ratios.')
+    group.add_argument('--dsv4-compress-rope-theta', default=40000.0, type=float,
+                       help='DeepSeek-V4 compressor RoPE theta.')
+    group.add_argument('--dsv4-o-groups', default=None, type=int,
+                       help='DeepSeek-V4 grouped output projection group count.')
+    group.add_argument('--dsv4-o-lora-rank', default=None, type=int,
+                       help='DeepSeek-V4 output projection LoRA rank.')
+    group.add_argument('--dsv4-n-hash-layers', default=0, type=int,
+                       help='Number of initial DeepSeek-V4 layers using hash routing.')
+    group.add_argument('--dsv4-window-size', default=4096, type=int,
+                       help='DeepSeek-V4 local attention window size.')
 
     return parser
 

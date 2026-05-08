@@ -391,6 +391,26 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             eps=self.config.layernorm_epsilon
         )
 
+        if self.config.dsv4_mode:
+            hc_mult = self.config.dsv4_hc_mult
+            hc_dim = hc_mult * self.config.hidden_size
+            mix_size = (2 + hc_mult) * hc_mult
+            self.hc_attn_fn = torch.nn.Parameter(torch.empty(mix_size, hc_dim, dtype=torch.float32))
+            self.hc_attn_base = torch.nn.Parameter(torch.empty(mix_size, dtype=torch.float32))
+            self.hc_attn_scale = torch.nn.Parameter(torch.empty(3, dtype=torch.float32))
+            self.hc_ffn_fn = torch.nn.Parameter(torch.empty(mix_size, hc_dim, dtype=torch.float32))
+            self.hc_ffn_base = torch.nn.Parameter(torch.empty(mix_size, dtype=torch.float32))
+            self.hc_ffn_scale = torch.nn.Parameter(torch.empty(3, dtype=torch.float32))
+            for param in (
+                self.hc_attn_fn,
+                self.hc_attn_base,
+                self.hc_attn_scale,
+                self.hc_ffn_fn,
+                self.hc_ffn_base,
+                self.hc_ffn_scale,
+            ):
+                param._keep_fp32 = True
+
         self.recompute_input_layernorm = False
         self.recompute_pre_mlp_layernorm = False
         self.recompute_mlp = False
@@ -472,8 +492,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # this is only used to uniquely identify decode and non-decode cuda graph
         # runners in the cuda graph manager
         kwargs.pop("dynamic_inference_decode_only", None)
+        input_ids = kwargs.pop("input_ids", None)
         hidden_states, context = self._forward_attention(*args, **kwargs)
-        output = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
+        output = self._forward_mlp(
+            hidden_states,
+            kwargs.get("inference_context", None),
+            input_ids=input_ids,
+        )
         return output, context
 
     def _forward_attention(
@@ -531,6 +556,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
 
+        if self.config.dsv4_mode:
+            from sirl.plugins.models.deepseek_v4.ops.hyper_connection import (
+                DeepSeekV4HyperConnectionUtil,
+            )
+
+            hc_util = DeepSeekV4HyperConnectionUtil(self.config)
+            hidden_states, hc_attn_post, hc_attn_comb = hc_util.layer_pre(
+                hidden_states,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+            )
+
         if self.offload_attn_norm:
             hidden_states = fine_grained_offloading_group_start(hidden_states, name="attn_norm")
         # Optional Input Layer norm
@@ -567,17 +605,22 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 attention_output_with_bias[0]
             )
 
-        attention_output, attention_output_bias = attention_output_with_bias
-        attention_output = self.post_self_attn_layernorm(attention_output)
-        attention_output_with_bias = (attention_output, attention_output_bias)
-
-        # TODO: could we move `bias_dropout_add_exec_handler` itself
-        # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="self_attn_bda")
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                attention_output_with_bias, residual, self.hidden_dropout
+        if self.config.dsv4_mode:
+            hidden_states = hc_util.layer_post(
+                attention_output_with_bias, residual, hc_attn_post, hc_attn_comb
             )
+        else:
+            attention_output, attention_output_bias = attention_output_with_bias
+            attention_output = self.post_self_attn_layernorm(attention_output)
+            attention_output_with_bias = (attention_output, attention_output_bias)
+
+            # TODO: could we move `bias_dropout_add_exec_handler` itself
+            # inside the module provided in the `bias_dropout_add_spec` module?
+            with self.bias_dropout_add_exec_handler():
+                hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
+                    attention_output_with_bias, residual, self.hidden_dropout
+                )
         nvtx_range_pop(suffix="self_attn_bda")
 
         if self.offload_attn_norm:
@@ -611,7 +654,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         return hidden_states, context
 
-    def _forward_mlp(self, hidden_states, inference_context=None):
+    def _forward_mlp(self, hidden_states, inference_context=None, input_ids=None):
         """
         Perform a forward pass through the feed-forward layer.
 
@@ -629,6 +672,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Residual connection.
         residual = hidden_states
+
+        if self.config.dsv4_mode:
+            from sirl.plugins.models.deepseek_v4.ops.hyper_connection import (
+                DeepSeekV4HyperConnectionUtil,
+            )
+
+            hc_util = DeepSeekV4HyperConnectionUtil(self.config)
+            hidden_states, hc_ffn_post, hc_ffn_comb = hc_util.layer_pre(
+                hidden_states,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+            )
 
         if self.offload_mlp_norm:
             hidden_states = fine_grained_offloading_group_start(hidden_states, name="mlp_norm")
@@ -662,7 +718,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             assert (
                 not self.recompute_pre_mlp_layernorm
             ), "Recomputation is not supported for CUDA graph."
-            cudagraph_outputs = self.mlp(pre_mlp_layernorm_output)
+            cudagraph_outputs = self.mlp(
+                pre_mlp_layernorm_output,
+                **({"input_ids": input_ids} if self.is_moe_layer else {}),
+            )
             nvtx_range_pop(suffix="mlp")
             return cudagraph_outputs + [residual]
         elif self.recompute_mlp:
@@ -676,18 +735,37 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     tensor_parallel.random.get_cuda_rng_tracker,
                     self.pg_collection.tp,
                     pre_mlp_layernorm_output,
+                    *([input_ids] if self.is_moe_layer else []),
                 )
             else:
                 mlp_output_with_bias = tensor_parallel.checkpoint(
-                    self.mlp, False, pre_mlp_layernorm_output
+                    self.mlp,
+                    False,
+                    pre_mlp_layernorm_output,
+                    *([input_ids] if self.is_moe_layer else []),
                 )
         elif should_chunk_mlp_for_prefill:
             # Chunk input along sequence dimension
             num_chunks = min(self.config.mlp_chunks_for_prefill, pre_mlp_layernorm_output.shape[0])
             chunks = pre_mlp_layernorm_output.chunk(num_chunks, dim=0)
+            input_id_chunks = (
+                input_ids.chunk(num_chunks, dim=0)
+                if self.is_moe_layer and input_ids is not None
+                else [None] * len(chunks)
+            )
 
             # Compute outputs for each chunk
-            outputs = [self.mlp(chunk) for chunk in chunks]
+            outputs = [
+                self.mlp(
+                    chunk,
+                    **(
+                        {"input_ids": input_id_chunk}
+                        if self.is_moe_layer and input_id_chunk is not None
+                        else {}
+                    ),
+                )
+                for chunk, input_id_chunk in zip(chunks, input_id_chunks, strict=True)
+            ]
 
             # Aggregate chunk outputs
             mlp_output = torch.cat([out for out, _ in outputs], dim=0)
@@ -695,7 +773,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             bias_output = torch.stack(bias_chunks, dim=0).sum(dim=0) if bias_chunks else None
             mlp_output_with_bias = (mlp_output, bias_output)
         else:
-            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
+            mlp_output_with_bias = self.mlp(
+                pre_mlp_layernorm_output,
+                **({"input_ids": input_ids} if self.is_moe_layer else {}),
+            )
 
         mlp_output, mlp_output_bias = mlp_output_with_bias
         mlp_output = self.post_mlp_layernorm(mlp_output)
@@ -709,9 +790,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
         nvtx_range_pop(suffix="mlp")
 
-        return self._forward_post_mlp(mlp_output_with_bias, residual)
+        return self._forward_post_mlp(
+            mlp_output_with_bias,
+            residual,
+            hc_ffn_post=hc_ffn_post if self.config.dsv4_mode else None,
+            hc_ffn_comb=hc_ffn_comb if self.config.dsv4_mode else None,
+        )
 
-    def _forward_post_mlp(self, mlp_output_with_bias, residual):
+    def _forward_post_mlp(self, mlp_output_with_bias, residual, *, hc_ffn_post=None, hc_ffn_comb=None):
         """
         Perform operations after the MLP computation.
 
@@ -730,10 +816,20 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="mlp_bda")
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
-                mlp_output_with_bias, residual, self.hidden_dropout
+        if self.config.dsv4_mode:
+            from sirl.plugins.models.deepseek_v4.ops.hyper_connection import (
+                DeepSeekV4HyperConnectionUtil,
             )
+
+            hc_util = DeepSeekV4HyperConnectionUtil(self.config)
+            hidden_states = hc_util.layer_post(
+                mlp_output_with_bias, residual, hc_ffn_post, hc_ffn_comb
+            )
+        else:
+            with self.bias_dropout_add_exec_handler():
+                hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
+                    mlp_output_with_bias, residual, self.hidden_dropout
+                )
         nvtx_range_pop(suffix="mlp_bda")
         if self.offload_mlp_norm:
             (hidden_states,) = fine_grained_offloading_group_commit(
@@ -853,7 +949,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 )
             )
         ):
-            hidden_states = self._forward_mlp(hidden_states)
+            hidden_states = self._forward_mlp(hidden_states, input_ids=kwargs.get("input_ids", None))
         if not isinstance(hidden_states, list) and not isinstance(hidden_states, tuple):
             cuda_graph_outputs = [hidden_states]
         else:
@@ -945,7 +1041,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             output = self._forward_post_mlp(mlp_output_with_bias, mlp_residual)
         else:
             # CUDA Graph does not capture the MLP/MoE part at all.
-            output = self._forward_mlp(*cuda_graph_output)
+            output = self._forward_mlp(*cuda_graph_output, input_ids=kwargs.get("input_ids", None))
         return output, context
 
     def _get_te_cuda_graph_replay_args(self, *args, **kwargs):

@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION and Alibaba PAI. All rights reserved.
 from collections import defaultdict
-from typing import Dict
+from collections.abc import Iterable
+from typing import Any, Dict
 
 import torch
 
@@ -9,6 +10,29 @@ def _param_generator(cpu_optimizer):
     for group in cpu_optimizer.param_groups:
         for param in group["params"]:
             yield param
+
+
+def _iter_group_params(params: Any):
+    if isinstance(params, torch.Tensor):
+        yield params
+        return
+
+    if isinstance(params, dict):
+        yield from _iter_group_params(params["params"])
+        return
+
+    if isinstance(params, Iterable):
+        for item in params:
+            if isinstance(item, dict):
+                yield from _iter_group_params(item["params"])
+            else:
+                yield item
+
+
+def _retain_nonleaf_param_grads(params: Any) -> None:
+    for param in _iter_group_params(params):
+        if param.requires_grad and not param.is_leaf and not param.retains_grad:
+            param.retain_grad()
 
 
 class HybridDeviceOptimizer(torch.optim.Optimizer):
@@ -54,6 +78,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         overlap_cpu_optimizer_d2h_h2d: bool = True,
         **kwargs,
     ):
+        _retain_nonleaf_param_grads(params)
         super(HybridDeviceOptimizer, self).__init__(
             params,
             defaults={

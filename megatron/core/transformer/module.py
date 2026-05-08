@@ -376,6 +376,45 @@ def float16_to_fp32(val):
     return conversion_helper(val, float_conversion)
 
 
+def _detach_keep_fp32_tensors(module: torch.nn.Module):
+    """Temporarily remove tensors marked _keep_fp32 from recursive dtype conversion."""
+    preserved_parameters = []
+    preserved_buffers = []
+    for child_module in module.modules():
+        for name, param in child_module._parameters.items():
+            if param is not None and getattr(param, '_keep_fp32', False):
+                assert param.dtype == torch.float32, (
+                    f"Parameter {name} is marked _keep_fp32 but has dtype {param.dtype}"
+                )
+                preserved_parameters.append((child_module, name, param))
+                child_module._parameters[name] = None
+        for name, buffer in child_module._buffers.items():
+            if buffer is not None and getattr(buffer, '_keep_fp32', False):
+                assert buffer.dtype == torch.float32, (
+                    f"Buffer {name} is marked _keep_fp32 but has dtype {buffer.dtype}"
+                )
+                preserved_buffers.append((child_module, name, buffer))
+                child_module._buffers[name] = None
+    return preserved_parameters, preserved_buffers
+
+
+def _restore_keep_fp32_tensors(preserved_tensors):
+    preserved_parameters, preserved_buffers = preserved_tensors
+    for child_module, name, param in preserved_parameters:
+        child_module._parameters[name] = param
+    for child_module, name, buffer in preserved_buffers:
+        child_module._buffers[name] = buffer
+
+
+def _convert_module_preserving_fp32_tensors(module: torch.nn.Module, convertor):
+    """Convert a module to low precision while preserving explicit fp32 tensors."""
+    preserved_tensors = _detach_keep_fp32_tensors(module)
+    try:
+        return convertor(module)
+    finally:
+        _restore_keep_fp32_tensors(preserved_tensors)
+
+
 class Float16Module(MegatronModule):
     """Float 16 Module.
 
@@ -398,13 +437,17 @@ class Float16Module(MegatronModule):
         self.pg_collection = getattr(module, 'pg_collection', None)
 
         if self.fp16:
-            self.add_module('module', module.half())
+            self.add_module(
+                'module', _convert_module_preserving_fp32_tensors(module, lambda m: m.half())
+            )
 
             def float16_convertor(val):
                 return val.half()
 
         elif self.bf16:
-            self.add_module('module', module.bfloat16())
+            self.add_module(
+                'module', _convert_module_preserving_fp32_tensors(module, lambda m: m.bfloat16())
+            )
 
             def float16_convertor(val):
                 return val.bfloat16()

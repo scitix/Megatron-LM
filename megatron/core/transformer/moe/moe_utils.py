@@ -537,6 +537,8 @@ def topk_routing_with_score_function(
     score_function: str = "softmax",
     expert_bias: Optional[torch.Tensor] = None,
     fused: bool = False,
+    tid2eid: Optional[torch.Tensor] = None,
+    input_ids: Optional[torch.Tensor] = None,
 ):
     """Compute the routing probabilities and map for top-k selection with score function.
     Args:
@@ -546,7 +548,8 @@ def topk_routing_with_score_function(
         num_groups (int): Number of groups for routed experts.
         group_topk (int): Number of selected groups for each token.
         scaling_factor (float): Scaling factor of routing score in top-k selection.
-        score_function (str): The score function to use. Can be either "softmax" or "sigmoid".
+        score_function (str): The score function to use. Can be "softmax", "sigmoid",
+            or "sqrtsoftplus".
         expert_bias (torch.Tensor): The bias added to logits for expert routing.
     Returns:
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -587,8 +590,10 @@ def topk_routing_with_score_function(
         else:
             return torch.topk(scores, k=topk, dim=1)
 
-    from sirl.utils.routing_replay import get_routing_replay_compute_topk
-    compute_topk = get_routing_replay_compute_topk(compute_topk)
+    if tid2eid is None:
+        from sirl.utils.replay_base import routing_replay_manager
+
+        compute_topk = routing_replay_manager.get_topk_fn(compute_topk, return_probs=True)
 
     if score_function == "softmax":
         if use_pre_softmax:
@@ -606,6 +611,25 @@ def topk_routing_with_score_function(
         else:
             scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
         probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
+    elif score_function == "sqrtsoftplus":
+        assert num_groups is None
+        assert group_topk is None
+        scores = torch.nn.functional.softplus(logits.float()).sqrt().type_as(logits)
+        if tid2eid is not None:
+            assert not tid2eid.requires_grad
+            assert input_ids is not None and not input_ids.requires_grad
+            assert input_ids.numel() == logits.shape[0], (
+                f"input_ids token count {input_ids.numel()} does not match router logits "
+                f"token count {logits.shape[0]}"
+            )
+            top_indices = tid2eid[input_ids].long()
+            assert torch.all(top_indices >= 0)
+        else:
+            assert expert_bias is not None
+            scores_for_routing = scores + expert_bias
+            _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
+        scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
+        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
     else:
         raise ValueError(f"Invalid score_function: {score_function}")
 
@@ -655,6 +679,9 @@ def compute_routing_scores_for_aux_loss(
         scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
     elif score_function == "sigmoid":
         scores = torch.sigmoid(logits)
+        scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+    elif score_function == "sqrtsoftplus":
+        scores = torch.nn.functional.softplus(logits.float()).sqrt()
         scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
     else:
         raise ValueError(f"Invalid score_function: {score_function}")

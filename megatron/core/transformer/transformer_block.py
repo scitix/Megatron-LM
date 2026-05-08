@@ -387,6 +387,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         else:
             self.final_layernorm = None  # Either this or nn.Identity
 
+        if self.config.dsv4_mode:
+            from sirl.plugins.models.deepseek_v4.ops.hyper_connection import (
+                DeepSeekV4HyperConnectionUtil,
+                HCHeadParams,
+            )
+
+            self.hc_util = DeepSeekV4HyperConnectionUtil(self.config)
+            if self.has_final_layernorm_in_this_stage():
+                self.hc_head_params = HCHeadParams(self.config)
+
     def has_final_layernorm_in_this_stage(self):
         """
         Check if this vpp stage contains the final layernorm.
@@ -419,6 +429,15 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
     def _get_layer(self, layer_number: int):
         return self.layers[layer_number]
 
+    def _prepare_router_input_ids(self, input_ids: Tensor) -> Tensor:
+        assert input_ids.dim() == 2
+        input_ids = input_ids.transpose(0, 1).contiguous()
+        if self.config.sequence_parallel:
+            input_ids = tensor_parallel.scatter_to_sequence_parallel_region(
+                input_ids, group=self.tp_group
+            )
+        return input_ids
+
     def _checkpointed_forward(
         self,
         hidden_states: Tensor,
@@ -429,12 +448,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         attention_bias: Tensor,
         packed_seq_params: PackedSeqParams,
         use_inner_quantization_context: bool,
+        input_ids: Optional[Tensor] = None,
     ):
         """Forward method with activation checkpointing."""
 
         def custom(start: int, end: int):
             def custom_forward(
-                hidden_states, attention_mask, context, context_mask, rotary_pos_emb
+                hidden_states, attention_mask, context, context_mask, rotary_pos_emb, input_ids=None
             ):
                 for index in range(start, end):
                     layer = self._get_layer(index)
@@ -465,6 +485,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             attention_bias=attention_bias,
                             inference_context=None,
                             packed_seq_params=packed_seq_params,
+                            input_ids=input_ids,
                         )
                 return hidden_states, context
 
@@ -484,6 +505,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     context,
                     context_mask,
                     rotary_pos_emb,
+                    input_ids,
                 )
             else:
                 return tensor_parallel.checkpoint(
@@ -494,6 +516,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     context,
                     context_mask,
                     rotary_pos_emb,
+                    input_ids,
                 )
 
         if self.config.recompute_method == 'uniform':
@@ -527,7 +550,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
                 else:
                     hidden_states, context = custom(layer_idx, layer_idx + 1)(
-                        hidden_states, attention_mask, context, context_mask, rotary_pos_emb
+                        hidden_states, attention_mask, context, context_mask, rotary_pos_emb, input_ids
                     )
         else:
             raise ValueError("Invalid activation recompute method.")
@@ -599,6 +622,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
+        input_ids: Optional[Tensor] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         dynamic_inference_decode_only: Optional[bool] = None,
@@ -669,6 +693,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         #   is called here to be future-proof and corner-case-proof.
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
+        if self.config.dsv4_mode and self.pre_process:
+            hidden_states = self.hc_util.block_expand(hidden_states)
+        if self.config.dsv4_mode and input_ids is not None:
+            input_ids = self._prepare_router_input_ids(input_ids)
+            assert input_ids.size(0) == hidden_states.size(0)
+            assert input_ids.size(1) == hidden_states.size(1)
+
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
@@ -708,6 +739,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     attention_bias=attention_bias,
                     packed_seq_params=packed_seq_params,
                     use_inner_quantization_context=use_inner_quantization_context,
+                    input_ids=input_ids,
                 )
             else:
                 for l_no, layer in enumerate(self.layers):
@@ -745,6 +777,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             inference_context=inference_context,
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
+                            input_ids=input_ids,
                         )
 
                     if (
@@ -753,6 +786,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         and self.group_prefetch_offload_commit_async is not None
                     ):
                         hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
+
+        if self.config.dsv4_mode and self.post_process and hasattr(self, "hc_head_params"):
+            hidden_states = self.hc_util.block_head(
+                hidden_states,
+                self.hc_head_params.hc_head_fn,
+                self.hc_head_params.hc_head_scale,
+                self.hc_head_params.hc_head_base,
+            )
 
         # Final layer norm.
         if self.final_layernorm is not None:

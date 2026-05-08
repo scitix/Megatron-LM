@@ -28,7 +28,10 @@ class Router(ABC, MegatronModule):
     """Base Router class"""
 
     def __init__(
-        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
+        self,
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        layer_number: Optional[int] = None,
     ) -> None:
         """
         Initialize the Router module.
@@ -62,6 +65,10 @@ class Router(ABC, MegatronModule):
         # So we need to know if the model is configured to calculate per token loss.
         self.calculate_per_token_loss = self.config.calculate_per_token_loss
         self.reset_parameters()
+        if self.config.moe_router_freeze_gate:
+            self.weight.requires_grad = False
+            if self.bias is not None:
+                self.bias.requires_grad = False
 
     def reset_parameters(self):
         """Reset the router parameters."""
@@ -90,6 +97,11 @@ class Router(ABC, MegatronModule):
         if self.bias is not None and self.bias.device.type == 'cpu':
             self.bias.data = self.bias.data.to(device=torch.cuda.current_device())
 
+        if self.config.moe_router_freeze_gate:
+            assert not self.weight.requires_grad
+            if self.bias is not None:
+                assert not self.bias.requires_grad
+
         # Convert to specified datatype for routing computation if enabled
         router_dtype = input.dtype
         if self.config.moe_router_dtype == 'fp32':
@@ -100,7 +112,7 @@ class Router(ABC, MegatronModule):
         return logits
 
     @abstractmethod
-    def routing(self, logits: torch.Tensor):
+    def routing(self, logits: torch.Tensor, input_ids: Optional[torch.Tensor] = None):
         """Routing function.
 
         Args:
@@ -113,12 +125,14 @@ class Router(ABC, MegatronModule):
         raise NotImplementedError("Routing function not implemented.")
 
     @abstractmethod
-    def forward(self, input: torch.Tensor):
+    def forward(self, input: torch.Tensor, input_ids: Optional[torch.Tensor] = None):
         """
         Forward pass of the router.
 
         Args:
             input (torch.Tensor): Input tensor.
+            input_ids (torch.Tensor, optional): Input token IDs for routing modes that
+                depend on token identity.
         """
         raise NotImplementedError("Forward function not implemented.")
 
@@ -144,21 +158,75 @@ class TopKRouter(Router):
     """
 
     def __init__(
-        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
+        self,
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        layer_number: Optional[int] = None,
     ) -> None:
         """Initialize the zero token dropping router.
 
         Args:
             config (TransformerConfig): The configuration for the transformer model.
             pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
+            layer_number (int, optional): Layer number for DeepSeek-V4 hash routing.
         """
         super().__init__(config=config, pg_collection=pg_collection)
+        self.layer_number = layer_number
         self.topk = self.config.moe_router_topk
         self.routing_type = self.config.moe_router_load_balancing_type
         self.score_function = self.config.moe_router_score_function
         self.input_jitter = None
 
-        self.enable_expert_bias = self.config.moe_router_enable_expert_bias
+        self._routing_mode_initialized = False
+        self.enable_expert_bias = False
+        self.tid2eid = None
+        self._frozen_expert_bias_snapshot = None
+        self._routing_replay_registered = False
+        if layer_number is not None:
+            self._init_routing_mode(layer_number)
+        elif not self.config.dsv4_mode:
+            self._init_routing_mode(0)
+
+        # Initialize global tokens per expert for global aux loss
+        if self.get_aux_loss_coeff("global_aux_loss") > 0:
+            self.register_buffer(
+                'global_tokens_per_expert',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                'ga_steps',
+                torch.tensor(0, dtype=torch.float32, device=torch.cuda.current_device()),
+                persistent=False,
+            )
+        else:
+            self.global_tokens_per_expert = None
+            self.ga_steps = None
+
+        self._register_routing_replay_if_needed()
+
+    def _register_routing_replay_if_needed(self):
+        from sirl.utils.replay_base import routing_replay_manager
+
+        if self._routing_replay_registered:
+            if hasattr(self, "routing_replay"):
+                self.routing_replay.metadata.update(
+                    routing_replay_manager._module_metadata(self, "routing_replay")
+                )
+            return
+        routing_replay_manager.register_to_module(self, "routing_replay")
+        self._routing_replay_registered = hasattr(self, "routing_replay")
+
+    def _init_routing_mode(self, layer_number: int):
+        assert not self._routing_mode_initialized
+        self._routing_mode_initialized = True
+
+        mode_hash = self.config.dsv4_mode and layer_number <= self.config.dsv4_n_hash_layers
+        self.enable_expert_bias = self.config.moe_router_enable_expert_bias and not mode_hash
         if self.enable_expert_bias:
             self.register_buffer(
                 'local_tokens_per_expert',
@@ -181,28 +249,22 @@ class TopKRouter(Router):
             self.local_tokens_per_expert = None
             self.expert_bias = None
 
-        # Initialize global tokens per expert for global aux loss
-        if self.get_aux_loss_coeff("global_aux_loss") > 0:
-            self.register_buffer(
-                'global_tokens_per_expert',
-                torch.zeros(
-                    self.config.num_moe_experts,
-                    dtype=torch.float32,
+        if mode_hash:
+            self.tid2eid = torch.nn.Parameter(
+                torch.full(
+                    (self.config.vocab_size, self.topk),
+                    fill_value=-1,
+                    dtype=torch.long,
                     device=torch.cuda.current_device(),
                 ),
-                persistent=False,
+                requires_grad=False,
             )
-            self.register_buffer(
-                'ga_steps',
-                torch.tensor(0, dtype=torch.float32, device=torch.cuda.current_device()),
-                persistent=False,
-            )
-        else:
-            self.global_tokens_per_expert = None
-            self.ga_steps = None
 
-        from sirl.utils.routing_replay import register_routing_replay
-        register_routing_replay(self)
+    def set_layer_number(self, layer_number: int):
+        self.layer_number = layer_number
+        if not self._routing_mode_initialized:
+            self._init_routing_mode(layer_number)
+        self._register_routing_replay_if_needed()
 
     def _maintain_float32_expert_bias(self):
         """
@@ -482,17 +544,21 @@ class TopKRouter(Router):
             with torch.no_grad():
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
 
-    def routing(self, logits: torch.Tensor):
+    def routing(self, logits: torch.Tensor, input_ids: Optional[torch.Tensor] = None):
         """Top-k routing function
 
         Args:
             logits (torch.Tensor): Logits tensor after gating.
+            input_ids (torch.Tensor, optional): Input token IDs for DeepSeek-V4 hash routing.
 
         Returns:
             probs (torch.Tensor): The probabilities of token to experts assignment.
             routing_map (torch.Tensor): The mapping of token to experts assignment,
                 with shape [num_tokens, num_experts].
         """
+        if self.config.dsv4_mode:
+            assert self._routing_mode_initialized
+
         seq_length, bsz = logits.shape[:2]
         logits = logits.view(-1, self.config.num_moe_experts)
 
@@ -513,6 +579,10 @@ class TopKRouter(Router):
                 score_function=self.score_function,
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
+                tid2eid=self.tid2eid,
+                input_ids=input_ids.reshape(-1)
+                if self.tid2eid is not None and input_ids is not None
+                else None,
             )
 
         # Apply token dropping to probs and routing_map.
@@ -551,14 +621,23 @@ class TopKRouter(Router):
             self.global_tokens_per_expert.zero_()
             self.ga_steps.zero_()
 
-    def forward(self, input: torch.Tensor):
+    def forward(self, input: torch.Tensor, input_ids: Optional[torch.Tensor] = None):
         """
         Forward pass of the router.
 
         Args:
             input (torch.Tensor): Input tensor.
+            input_ids (torch.Tensor, optional): Input token IDs for DeepSeek-V4 hash routing.
         """
         self._maintain_float32_expert_bias()
+
+        if self.config.freeze_e_score_correction_bias and self.enable_expert_bias:
+            if self._frozen_expert_bias_snapshot is None:
+                self._frozen_expert_bias_snapshot = self.expert_bias.clone()
+            else:
+                assert torch.equal(
+                    self.expert_bias, self._frozen_expert_bias_snapshot
+                ), "expert_bias was modified but freeze_e_score_correction_bias is enabled"
 
         # Apply input jitter
         input = self.apply_input_jitter(input)
@@ -568,7 +647,7 @@ class TopKRouter(Router):
             # Apply force load balancing with random logits for benchmark
             logits = apply_random_logits(logits)
 
-        probs, routing_map = self.routing(logits)
+        probs, routing_map = self.routing(logits, input_ids=input_ids)
 
         return probs, routing_map
 

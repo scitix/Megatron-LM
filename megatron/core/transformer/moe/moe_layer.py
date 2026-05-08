@@ -178,13 +178,13 @@ class MoELayer(BaseMoELayer):
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
 
     @maybe_skip_or_early_return_by_cudagraph("route")
-    def route(self, hidden_states: torch.Tensor):
+    def route(self, hidden_states: torch.Tensor, input_ids: Optional[torch.Tensor] = None):
         """Compute token routing for preprocessing.
 
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
         """
-        probs, routing_map = self.router(hidden_states)
+        probs, routing_map = self.router(hidden_states, input_ids=input_ids)
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
@@ -270,7 +270,7 @@ class MoELayer(BaseMoELayer):
             output = output + shared_expert_output
         return output
 
-    def forward(self, hidden_states: torch.Tensor):
+    def forward(self, hidden_states: torch.Tensor, input_ids: Optional[torch.Tensor] = None):
         """Forward pass for the MoE layer.
 
         The forward pass comprises four main steps:
@@ -281,6 +281,7 @@ class MoELayer(BaseMoELayer):
 
         Args:
             hidden_states (torch.Tensor): The input tensor to the MoE layer.
+            input_ids (torch.Tensor, optional): Token IDs for DeepSeek-V4 hash routing.
 
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
@@ -292,10 +293,10 @@ class MoELayer(BaseMoELayer):
             )
 
         # MoE forward: route -> dispatch -> compute -> combine
-        def custom_forward(hidden_states):
+        def custom_forward(hidden_states, input_ids=None):
             try:
                 shared_expert_output = self.shared_experts_compute(hidden_states)
-                probs, routing_map = self.route(hidden_states)
+                probs, routing_map = self.route(hidden_states, input_ids=input_ids)
                 hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
             except MoECudaGraphPartialCaptureSignal as e:
                 # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
@@ -318,11 +319,12 @@ class MoELayer(BaseMoELayer):
                     tensor_parallel.random.get_cuda_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
                     hidden_states,
+                    input_ids,
                 )
             else:
-                outputs = tensor_parallel.checkpoint(custom_forward, False, hidden_states)
+                outputs = tensor_parallel.checkpoint(custom_forward, False, hidden_states, input_ids)
         else:
-            outputs = custom_forward(hidden_states)
+            outputs = custom_forward(hidden_states, input_ids=input_ids)
 
         return outputs
 

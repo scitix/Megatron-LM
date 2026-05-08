@@ -330,9 +330,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         shard_float16_groups = []
         shard_fp32_groups = []
         shard_fp32_from_float16_groups = []
+        model_param_group_index_map = {}
 
         # Allocate (or slice) each group's param shard.
-        for group_range in opt_group_ranges:
+        for group_index, group_range in enumerate(opt_group_ranges):
 
             # Params of this group.
             model_float16_params_this_group = []
@@ -445,12 +446,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     *shard_float16_params_this_group,
                 ]
 
+            for group_order, model_param in enumerate(model_fp32_params_this_group):
+                model_param_group_index_map[model_param] = (group_index, group_order)
+            offset = len(model_fp32_params_this_group)
+            for i, model_param in enumerate(model_float16_params_this_group):
+                model_param_group_index_map[model_param] = (group_index, offset + i)
+
         return (
             model_float16_groups,
             model_fp32_groups,
             shard_float16_groups,
             shard_fp32_groups,
             shard_fp32_from_float16_groups,
+            model_param_group_index_map,
         )
 
     def __init__(
@@ -581,7 +589,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         param.main_param_sharded = True
 
         # Optimizer ranges.
-        (self.model_param_group_index_map, self.opt_group_ranges) = (
+        (_, self.opt_group_ranges) = (
             self._build_optimizer_group_ranges(self.optimizer.param_groups, self.gbuf_ranges)
         )
 
@@ -592,6 +600,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.shard_float16_groups,
             self.shard_fp32_groups,
             self.shard_fp32_from_float16_groups,
+            self.model_param_group_index_map,
         ) = self._build_model_and_main_param_groups(
             self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
         )
