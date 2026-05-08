@@ -93,6 +93,13 @@ class BaseMoELayer(MegatronModule, ABC):
         self.layer_number = layer_number
         self.router.set_layer_number(layer_number)
 
+    def set_is_mtp(self):
+        """Mark this MoE layer as an MTP layer."""
+        if hasattr(self.router, 'set_is_mtp'):
+            self.router.set_is_mtp()
+        else:
+            self.router.is_mtp = True
+
 
 class MoELayer(BaseMoELayer):
     """Mixture of Experts layer.
@@ -177,14 +184,13 @@ class MoELayer(BaseMoELayer):
         # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
 
-    @maybe_skip_or_early_return_by_cudagraph("route")
-    def route(self, hidden_states: torch.Tensor, input_ids: Optional[torch.Tensor] = None):
+    def route(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None, input_ids: Optional[torch.Tensor] = None):
         """Compute token routing for preprocessing.
 
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
         """
-        probs, routing_map = self.router(hidden_states, input_ids=input_ids)
+        probs, routing_map = self.router(hidden_states, padding_mask, input_ids=input_ids)
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
@@ -270,7 +276,7 @@ class MoELayer(BaseMoELayer):
             output = output + shared_expert_output
         return output
 
-    def forward(self, hidden_states: torch.Tensor, input_ids: Optional[torch.Tensor] = None):
+    def forward(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None, input_ids: Optional[torch.Tensor] = None):
         """Forward pass for the MoE layer.
 
         The forward pass comprises four main steps:
@@ -281,7 +287,8 @@ class MoELayer(BaseMoELayer):
 
         Args:
             hidden_states (torch.Tensor): The input tensor to the MoE layer.
-            input_ids (torch.Tensor, optional): Token IDs for DeepSeek-V4 hash routing.
+            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
+            input_ids (torch.Tensor, optional): Input token IDs for DSV4 hash routing.
 
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
@@ -293,10 +300,10 @@ class MoELayer(BaseMoELayer):
             )
 
         # MoE forward: route -> dispatch -> compute -> combine
-        def custom_forward(hidden_states, input_ids=None):
+        def custom_forward(hidden_states, padding_mask=None, input_ids=None):
             try:
                 shared_expert_output = self.shared_experts_compute(hidden_states)
-                probs, routing_map = self.route(hidden_states, input_ids=input_ids)
+                probs, routing_map = self.route(hidden_states, padding_mask, input_ids=input_ids)
                 hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
             except MoECudaGraphPartialCaptureSignal as e:
                 # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
@@ -319,12 +326,13 @@ class MoELayer(BaseMoELayer):
                     tensor_parallel.random.get_cuda_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
                     hidden_states,
+                    padding_mask,
                     input_ids,
                 )
             else:
-                outputs = tensor_parallel.checkpoint(custom_forward, False, hidden_states, input_ids)
+                outputs = tensor_parallel.checkpoint(custom_forward, False, hidden_states, padding_mask, input_ids)
         else:
-            outputs = custom_forward(hidden_states, input_ids=input_ids)
+            outputs = custom_forward(hidden_states, padding_mask, input_ids)
 
         return outputs
 

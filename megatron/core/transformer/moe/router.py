@@ -45,6 +45,7 @@ class Router(ABC, MegatronModule):
         self.num_experts = self.config.num_moe_experts
         self.moe_aux_loss_func = None
         self.layer_number = None
+        self.is_mtp = False
         self.tp_group = pg_collection.tp
         self.cp_group = pg_collection.cp
         self.tp_cp_group = pg_collection.tp_cp
@@ -260,7 +261,66 @@ class TopKRouter(Router):
                 requires_grad=False,
             )
 
+    def _init_routing_mode(self, layer_number):
+        assert not self._routing_mode_initialized
+        self._routing_mode_initialized = True
+
+        if not self.config.dsv4_mode:
+            return
+
+        mode_hash = layer_number <= self.config.dsv4_n_hash_layers and not self.is_mtp
+
+        self.enable_expert_bias = (
+            self.config.moe_router_enable_expert_bias and not mode_hash
+        )
+        if self.enable_expert_bias and self.local_tokens_per_expert is None:
+            self.register_buffer(
+                'local_tokens_per_expert',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                'expert_bias',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                ),
+            )
+        elif not self.enable_expert_bias:
+            self.local_tokens_per_expert = None
+            self.expert_bias = None
+
+        if mode_hash:
+            self.tid2eid = torch.nn.Parameter(
+                torch.full(
+                    (self.config.vocab_size, self.topk),
+                    fill_value=-1,
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+
+    def set_is_mtp(self):
+        """Mark this router as belonging to an MTP layer."""
+        self.is_mtp = True
+        if not self.config.dsv4_mode or not self._routing_mode_initialized:
+            return
+        if self.tid2eid is None:
+            return
+
+        # DeepSeek V4 MTP checkpoint stores gate bias, not tid2eid. Reduced
+        # layer-count smoke tests can otherwise number MTP inside the hash-routed
+        # prefix and leave all MTP tid2eid entries at -1.
+        del self.tid2eid
+        self.tid2eid = None
+
     def set_layer_number(self, layer_number: int):
+        """Set the layer number and initialize DSV4 routing mode."""
         self.layer_number = layer_number
         if not self._routing_mode_initialized:
             self._init_routing_mode(layer_number)
@@ -549,7 +609,7 @@ class TopKRouter(Router):
 
         Args:
             logits (torch.Tensor): Logits tensor after gating.
-            input_ids (torch.Tensor, optional): Input token IDs for DeepSeek-V4 hash routing.
+            input_ids (torch.Tensor, optional): Input token IDs for hash routing (DSV4).
 
         Returns:
             probs (torch.Tensor): The probabilities of token to experts assignment.
@@ -579,10 +639,9 @@ class TopKRouter(Router):
                 score_function=self.score_function,
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
+                is_mtp=self.is_mtp,
                 tid2eid=self.tid2eid,
-                input_ids=input_ids.reshape(-1)
-                if self.tid2eid is not None and input_ids is not None
-                else None,
+                input_ids=input_ids.view(-1) if self.tid2eid is not None and input_ids is not None else None,
             )
 
         # Apply token dropping to probs and routing_map.
@@ -621,13 +680,14 @@ class TopKRouter(Router):
             self.global_tokens_per_expert.zero_()
             self.ga_steps.zero_()
 
-    def forward(self, input: torch.Tensor, input_ids: Optional[torch.Tensor] = None):
+    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None, input_ids: Optional[torch.Tensor] = None):
         """
         Forward pass of the router.
 
         Args:
             input (torch.Tensor): Input tensor.
-            input_ids (torch.Tensor, optional): Input token IDs for DeepSeek-V4 hash routing.
+            padding_mask (torch.Tensor, optional): Padding mask (unused, for API compat).
+            input_ids (torch.Tensor, optional): Input token IDs for DSV4 hash routing.
         """
         self._maintain_float32_expert_bias()
 

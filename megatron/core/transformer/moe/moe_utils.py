@@ -537,6 +537,7 @@ def topk_routing_with_score_function(
     score_function: str = "softmax",
     expert_bias: Optional[torch.Tensor] = None,
     fused: bool = False,
+    is_mtp: bool = False,
     tid2eid: Optional[torch.Tensor] = None,
     input_ids: Optional[torch.Tensor] = None,
 ):
@@ -551,6 +552,9 @@ def topk_routing_with_score_function(
         score_function (str): The score function to use. Can be "softmax", "sigmoid",
             or "sqrtsoftplus".
         expert_bias (torch.Tensor): The bias added to logits for expert routing.
+        is_mtp (bool, optional): Whether this is an MTP layer. MTP layers bypass routing replay.
+        tid2eid (torch.Tensor, optional): Token-to-expert-id mapping for DSV4 hash routing.
+        input_ids (torch.Tensor, optional): Flat input token IDs for hash routing lookup.
     Returns:
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             - routing_probs (torch.Tensor): A tensor of shape [num_tokens, num_experts] containing
@@ -590,10 +594,21 @@ def topk_routing_with_score_function(
         else:
             return torch.topk(scores, k=topk, dim=1)
 
-    if tid2eid is None:
-        from sirl.utils.replay_base import routing_replay_manager
+    from sirl.utils.routing_replay import get_routing_replay_compute_topk
+    # MTP layers and hash-routed layers (tid2eid is not None) bypass replay
+    # since MTP routing is non-standard and hash routing is deterministic.
+    if not is_mtp and tid2eid is None:
+        compute_topk = get_routing_replay_compute_topk(compute_topk)
 
-        compute_topk = routing_replay_manager.get_topk_fn(compute_topk, return_probs=True)
+    # DSV4 hash routing: look up expert assignment directly from token ids
+    if tid2eid is not None:
+        assert not tid2eid.requires_grad
+        assert input_ids is not None, "input_ids required for tid2eid hash routing"
+        top_indices = tid2eid[input_ids]
+        probs = torch.ones(top_indices.shape, dtype=logits.dtype, device=logits.device)
+        routing_map = torch.zeros_like(logits, dtype=torch.bool)
+        routing_map.scatter_(1, top_indices.long(), True)
+        return probs, routing_map
 
     if score_function == "softmax":
         if use_pre_softmax:
