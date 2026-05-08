@@ -137,8 +137,8 @@ class MLP(MegatronModule):
 
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
-            self.config.ffn_hidden_size if not use_latent_size else self.config.moe_latent_size,
-            self.config.hidden_size,
+            self.config.ffn_hidden_size,
+            self.config.hidden_size if not use_latent_size else self.config.moe_latent_size,
             config=self.config,
             init_method=self.config.output_layer_init_method,
             bias=self.config.add_bias_linear,

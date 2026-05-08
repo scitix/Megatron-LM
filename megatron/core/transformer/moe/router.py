@@ -222,45 +222,6 @@ class TopKRouter(Router):
         routing_replay_manager.register_to_module(self, "routing_replay")
         self._routing_replay_registered = hasattr(self, "routing_replay")
 
-    def _init_routing_mode(self, layer_number: int):
-        assert not self._routing_mode_initialized
-        self._routing_mode_initialized = True
-
-        mode_hash = self.config.dsv4_mode and layer_number <= self.config.dsv4_n_hash_layers
-        self.enable_expert_bias = self.config.moe_router_enable_expert_bias and not mode_hash
-        if self.enable_expert_bias:
-            self.register_buffer(
-                'local_tokens_per_expert',
-                torch.zeros(
-                    self.config.num_moe_experts,
-                    dtype=torch.float32,
-                    device=torch.cuda.current_device(),
-                ),
-                persistent=False,
-            )
-            self.register_buffer(
-                'expert_bias',
-                torch.zeros(
-                    self.config.num_moe_experts,
-                    dtype=torch.float32,
-                    device=torch.cuda.current_device(),
-                ),
-            )
-        else:
-            self.local_tokens_per_expert = None
-            self.expert_bias = None
-
-        if mode_hash:
-            self.tid2eid = torch.nn.Parameter(
-                torch.full(
-                    (self.config.vocab_size, self.topk),
-                    fill_value=-1,
-                    dtype=torch.long,
-                    device=torch.cuda.current_device(),
-                ),
-                requires_grad=False,
-            )
-
     def _init_routing_mode(self, layer_number):
         assert not self._routing_mode_initialized
         self._routing_mode_initialized = True
