@@ -650,16 +650,6 @@ def topk_routing_with_score_function(
     if not is_mtp and tid2eid is None:
         compute_topk = get_routing_replay_compute_topk(compute_topk)
 
-    # DSV4 hash routing: look up expert assignment directly from token ids
-    if tid2eid is not None:
-        assert not tid2eid.requires_grad
-        assert input_ids is not None, "input_ids required for tid2eid hash routing"
-        top_indices = tid2eid[input_ids]
-        probs = torch.ones(top_indices.shape, dtype=logits.dtype, device=logits.device)
-        routing_map = torch.zeros_like(logits, dtype=torch.bool)
-        routing_map.scatter_(1, top_indices.long(), True)
-        return probs, routing_map
-
     if score_function == "softmax":
         if use_pre_softmax:
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
