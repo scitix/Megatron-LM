@@ -3,7 +3,6 @@
 import functools
 import logging
 import math
-import os
 import warnings
 from contextlib import nullcontext
 from enum import Enum
@@ -90,7 +89,6 @@ class _ParamAndGradBucket:
         numel_unpadded: int,
         gradient_scaling_factor: float,
         bucket_id: int,
-        param_to_name: Optional[Dict[torch.nn.Parameter, str]] = None,
     ):
         self.params_list = params
         self.params = set(params)
@@ -104,7 +102,6 @@ class _ParamAndGradBucket:
         self.numel_unpadded = numel_unpadded
         self.gradient_scaling_factor = gradient_scaling_factor
         self.bucket_id = bucket_id
-        self.param_to_name = param_to_name if param_to_name is not None else {}
         self.param_to_index = {}
         offset = 0
         for param in params:
@@ -188,54 +185,6 @@ class _ParamAndGradBucketGroup:
         self.params_with_grad = set()
         self.is_last_microbatch = True
 
-    def _log_nonfinite_grad_bucket(self, group_bucket_index: int, grad_norm: torch.Tensor) -> None:
-        limit = int(os.environ.get("SIRL_DEBUG_GRAD_NAN_BUCKET_PARAM_LIMIT", "40"))
-        bucket = self.buckets[group_bucket_index]
-        grad_data = bucket.grad_data.detach()
-        nonfinite = ~torch.isfinite(grad_data)
-        first_nonfinite = nonfinite.flatten().nonzero(as_tuple=False)
-        first_index = int(first_nonfinite[0].item()) if first_nonfinite.numel() else -1
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
-        lines = [
-            "[SIRL_GRAD_NAN_BUCKET] "
-            f"rank={rank} group_bucket_index={group_bucket_index} "
-            f"bucket_id={bucket.bucket_id} offset={bucket.offset} "
-            f"numel={grad_data.numel()} numel_unpadded={bucket.numel_unpadded} "
-            f"dtype={grad_data.dtype} device={grad_data.device} "
-            f"grad_norm={grad_norm.item()} "
-            f"nonfinite_count={int(nonfinite.sum().item())} "
-            f"nan_count={int(torch.isnan(grad_data).sum().item())} "
-            f"inf_count={int(torch.isinf(grad_data).sum().item())} "
-            f"first_nonfinite_flat_index={first_index}",
-        ]
-        emitted = 0
-        for param in bucket.params_list:
-            grad = param.main_grad.detach()
-            bad = ~torch.isfinite(grad)
-            if not bad.any():
-                continue
-            flat_bad = bad.flatten().nonzero(as_tuple=False)
-            flat_index = int(flat_bad[0].item())
-            flat_grad = grad.flatten()
-            name = bucket.param_to_name[param]
-            lines.append(
-                "[SIRL_GRAD_NAN_PARAM] "
-                f"rank={rank} bucket_id={bucket.bucket_id} name={name} "
-                f"shape={tuple(param.shape)} grad_dtype={grad.dtype} "
-                f"bad_count={int(bad.sum().item())} "
-                f"nan_count={int(torch.isnan(grad).sum().item())} "
-                f"inf_count={int(torch.isinf(grad).sum().item())} "
-                f"first_bad_flat_index={flat_index} first_bad_value={flat_grad[flat_index].item()}"
-            )
-            emitted += 1
-            if emitted >= limit:
-                lines.append(
-                    "[SIRL_GRAD_NAN_PARAM] "
-                    f"rank={rank} bucket_id={bucket.bucket_id} truncated_after={limit}"
-                )
-                break
-        print("\n".join(lines), flush=True)
-
     def check_grads(self, check_for_nan_or_inf, check_for_large):
         """
         Make sure norm of grads in bucket are not NaN prior to data-parallel
@@ -246,10 +195,6 @@ class _ParamAndGradBucketGroup:
             grad_norm = self.buckets[i].grad_data.norm(p=2)
             # check for NaN, Inf and unexpectedly large grads
             if check_for_nan_or_inf:
-                if os.environ.get("SIRL_DEBUG_GRAD_NAN_BUCKET") == "1" and (
-                    torch.isnan(grad_norm) or torch.isinf(grad_norm)
-                ):
-                    self._log_nonfinite_grad_bucket(i, grad_norm)
                 rerun_state_machine.validate_result(
                     result=grad_norm,
                     rejection_func=torch.isnan,
@@ -621,7 +566,6 @@ class _ParamAndGradBuffer:
 
         self.ddp_config = ddp_config
         self.params = params
-        self.param_to_name = param_to_name
         self.param_indices = param_indices
 
         # Check that params are unique.
@@ -950,7 +894,6 @@ class _ParamAndGradBuffer:
             numel_unpadded=numel_unpadded,
             gradient_scaling_factor=self.gradient_scaling_factor,
             bucket_id=bucket_id,
-            param_to_name=self.param_to_name,
         )
         for bucket_param in bucket_params:
             assert bucket_param not in self.param_to_bucket
