@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import functools
 import logging
 import warnings
 from abc import ABC
@@ -308,6 +309,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             layer_number=self.layer_number,
             **attention_optional_kwargs,
         )
+        if self.config.dsv4_mode and getattr(self.self_attention, "indexer", None) is not None:
+            # DSV4 indexer parameters produce integer top-k indices, so no grad flows to them.
+            for param in self.self_attention.indexer.parameters():
+                param.requires_grad_(False)
 
         # [Module 3: BiasDropoutFusion]
         self.self_attn_bda = build_module(submodules.self_attn_bda)
@@ -410,6 +415,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 self.hc_ffn_scale,
             ):
                 param._keep_fp32 = True
+                # The DSV4 HC mixer uses these parameters under torch.no_grad().
+                param.requires_grad_(False)
 
         self.recompute_input_layernorm = False
         self.recompute_pre_mlp_layernorm = False
@@ -497,6 +504,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),
+            padding_mask=kwargs.get("padding_mask", None),
             input_ids=input_ids,
         )
         return output, context
@@ -515,6 +523,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         inference_context: Optional[Any] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -654,7 +663,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         return hidden_states, context
 
-    def _forward_mlp(self, hidden_states, inference_context=None, input_ids=None):
+    def _forward_mlp(self, hidden_states, inference_context=None, padding_mask=None, input_ids=None):
         """
         Perform a forward pass through the feed-forward layer.
 
@@ -720,7 +729,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             ), "Recomputation is not supported for CUDA graph."
             cudagraph_outputs = self.mlp(
                 pre_mlp_layernorm_output,
-                **({"input_ids": input_ids} if self.is_moe_layer else {}),
+                **(
+                    {"padding_mask": padding_mask, "input_ids": input_ids}
+                    if self.is_moe_layer
+                    else {}
+                ),
             )
             nvtx_range_pop(suffix="mlp")
             return cudagraph_outputs + [residual]
@@ -730,19 +743,21 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 from megatron.core.extensions.transformer_engine import te_checkpoint
 
                 mlp_output_with_bias = te_checkpoint(
-                    self.mlp,
+                    functools.partial(self.mlp, padding_mask=padding_mask, input_ids=input_ids)
+                    if self.is_moe_layer
+                    else self.mlp,
                     False,
                     tensor_parallel.random.get_cuda_rng_tracker,
                     self.pg_collection.tp,
                     pre_mlp_layernorm_output,
-                    *([input_ids] if self.is_moe_layer else []),
                 )
             else:
                 mlp_output_with_bias = tensor_parallel.checkpoint(
-                    self.mlp,
+                    functools.partial(self.mlp, padding_mask=padding_mask, input_ids=input_ids)
+                    if self.is_moe_layer
+                    else self.mlp,
                     False,
                     pre_mlp_layernorm_output,
-                    *([input_ids] if self.is_moe_layer else []),
                 )
         elif should_chunk_mlp_for_prefill:
             # Chunk input along sequence dimension
@@ -753,18 +768,28 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 if self.is_moe_layer and input_ids is not None
                 else [None] * len(chunks)
             )
+            padding_mask_chunks = (
+                padding_mask.chunk(num_chunks, dim=1)
+                if self.is_moe_layer and padding_mask is not None
+                else [None] * len(chunks)
+            )
 
             # Compute outputs for each chunk
             outputs = [
                 self.mlp(
                     chunk,
                     **(
-                        {"input_ids": input_id_chunk}
-                        if self.is_moe_layer and input_id_chunk is not None
+                        {"padding_mask": padding_mask_chunk, "input_ids": input_id_chunk}
+                        if self.is_moe_layer
                         else {}
                     ),
                 )
-                for chunk, input_id_chunk in zip(chunks, input_id_chunks, strict=True)
+                for chunk, padding_mask_chunk, input_id_chunk in zip(
+                    chunks,
+                    padding_mask_chunks,
+                    input_id_chunks,
+                    strict=True,
+                )
             ]
 
             # Aggregate chunk outputs
@@ -775,7 +800,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         else:
             mlp_output_with_bias = self.mlp(
                 pre_mlp_layernorm_output,
-                **({"input_ids": input_ids} if self.is_moe_layer else {}),
+                **(
+                    {"padding_mask": padding_mask, "input_ids": input_ids}
+                    if self.is_moe_layer
+                    else {}
+                ),
             )
 
         mlp_output, mlp_output_bias = mlp_output_with_bias
@@ -949,7 +978,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 )
             )
         ):
-            hidden_states = self._forward_mlp(hidden_states, input_ids=kwargs.get("input_ids", None))
+            hidden_states = self._forward_mlp(
+                hidden_states,
+                padding_mask=kwargs.get("padding_mask", None),
+                input_ids=kwargs.get("input_ids", None),
+            )
         if not isinstance(hidden_states, list) and not isinstance(hidden_states, tuple):
             cuda_graph_outputs = [hidden_states]
         else:
@@ -1041,7 +1074,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             output = self._forward_post_mlp(mlp_output_with_bias, mlp_residual)
         else:
             # CUDA Graph does not capture the MLP/MoE part at all.
-            output = self._forward_mlp(*cuda_graph_output, input_ids=kwargs.get("input_ids", None))
+            output = self._forward_mlp(
+                *cuda_graph_output,
+                padding_mask=kwargs.get("padding_mask", None),
+                input_ids=kwargs.get("input_ids", None),
+            )
         return output, context
 
     def _get_te_cuda_graph_replay_args(self, *args, **kwargs):

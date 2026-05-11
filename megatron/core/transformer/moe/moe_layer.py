@@ -298,6 +298,8 @@ class MoELayer(BaseMoELayer):
                 "During training, performance may degrade if MoE and tensor parallelism"
                 "are enabled without also enabling sequence parallelism."
             )
+        if padding_mask is not None:
+            padding_mask = padding_mask.transpose(0, 1).bool()
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, padding_mask=None, input_ids=None):

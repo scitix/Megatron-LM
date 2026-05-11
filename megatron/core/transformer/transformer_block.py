@@ -396,6 +396,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             self.hc_util = DeepSeekV4HyperConnectionUtil(self.config)
             if self.has_final_layernorm_in_this_stage():
                 self.hc_head_params = HCHeadParams(self.config)
+                for param in self.hc_head_params.parameters():
+                    # The DSV4 HC head uses these parameters under torch.no_grad().
+                    param.requires_grad_(False)
 
     def has_final_layernorm_in_this_stage(self):
         """
@@ -448,13 +451,20 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         attention_bias: Tensor,
         packed_seq_params: PackedSeqParams,
         use_inner_quantization_context: bool,
+        padding_mask: Optional[Tensor] = None,
         input_ids: Optional[Tensor] = None,
     ):
         """Forward method with activation checkpointing."""
 
         def custom(start: int, end: int):
             def custom_forward(
-                hidden_states, attention_mask, context, context_mask, rotary_pos_emb, input_ids=None
+                hidden_states,
+                attention_mask,
+                context,
+                context_mask,
+                rotary_pos_emb,
+                padding_mask=None,
+                input_ids=None,
             ):
                 for index in range(start, end):
                     layer = self._get_layer(index)
@@ -485,6 +495,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             attention_bias=attention_bias,
                             inference_context=None,
                             packed_seq_params=packed_seq_params,
+                            padding_mask=padding_mask,
                             input_ids=input_ids,
                         )
                 return hidden_states, context
@@ -505,6 +516,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     context,
                     context_mask,
                     rotary_pos_emb,
+                    padding_mask,
                     input_ids,
                 )
             else:
@@ -516,6 +528,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     context,
                     context_mask,
                     rotary_pos_emb,
+                    padding_mask,
                     input_ids,
                 )
 
@@ -550,7 +563,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
                 else:
                     hidden_states, context = custom(layer_idx, layer_idx + 1)(
-                        hidden_states, attention_mask, context, context_mask, rotary_pos_emb, input_ids
+                        hidden_states,
+                        attention_mask,
+                        context,
+                        context_mask,
+                        rotary_pos_emb,
+                        padding_mask,
+                        input_ids,
                     )
         else:
             raise ValueError("Invalid activation recompute method.")
@@ -622,6 +641,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
         input_ids: Optional[Tensor] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
@@ -739,6 +759,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     attention_bias=attention_bias,
                     packed_seq_params=packed_seq_params,
                     use_inner_quantization_context=use_inner_quantization_context,
+                    padding_mask=padding_mask,
                     input_ids=input_ids,
                 )
             else:
@@ -777,6 +798,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             inference_context=inference_context,
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
+                            padding_mask=padding_mask,
                             input_ids=input_ids,
                         )
 

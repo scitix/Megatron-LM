@@ -1,6 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION and Alibaba PAI. All rights reserved.
 from collections import defaultdict
-from collections.abc import Iterable
 from typing import Any, Dict
 
 import torch
@@ -10,29 +9,6 @@ def _param_generator(cpu_optimizer):
     for group in cpu_optimizer.param_groups:
         for param in group["params"]:
             yield param
-
-
-def _iter_group_params(params: Any):
-    if isinstance(params, torch.Tensor):
-        yield params
-        return
-
-    if isinstance(params, dict):
-        yield from _iter_group_params(params["params"])
-        return
-
-    if isinstance(params, Iterable):
-        for item in params:
-            if isinstance(item, dict):
-                yield from _iter_group_params(item["params"])
-            else:
-                yield item
-
-
-def _retain_nonleaf_param_grads(params: Any) -> None:
-    for param in _iter_group_params(params):
-        if param.requires_grad and not param.is_leaf and not param.retains_grad:
-            param.retain_grad()
 
 
 class HybridDeviceOptimizer(torch.optim.Optimizer):
@@ -78,7 +54,6 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         overlap_cpu_optimizer_d2h_h2d: bool = True,
         **kwargs,
     ):
-        _retain_nonleaf_param_grads(params)
         super(HybridDeviceOptimizer, self).__init__(
             params,
             defaults={
@@ -118,6 +93,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     fp32_param.grad = grad.to(fp32_param.dtype)
                     fp32_param.requires_grad = True
                 else:
+                    fp32_param.grad = None
                     fp32_param.requires_grad = False
 
         # Sync the grads from GPU to CPU.
@@ -126,6 +102,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 gpu_param = self.cpu_copys_map_gpu_param[param]
                 grad = getattr(gpu_param, "decoupled_grad", gpu_param.grad)
                 if grad is None:
+                    param.grad = None
                     param.requires_grad = False
                     continue
 
@@ -402,8 +379,15 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         """
         Update the fp32 parameters by the new parameters.
         """
+        updated_params = set()
         for param, fp32_param in self.param_to_fp32_param.items():
             fp32_param.data.copy_(param)
+            updated_params.add(fp32_param)
+        # FP32 params offloaded to CPU are already master params, so they are
+        # tracked only as CPU copies and still need refresh after checkpoint load.
+        for param, cpu_param in self.gpu_params_map_cpu_copy.items():
+            if cpu_param not in updated_params:
+                cpu_param.data.copy_(param)
 
     def _register_load_state_dict_hooks(self):
         def pre_load_state_dict_hook(self, state_dict):
@@ -467,6 +451,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         Zero or zero to none the gradients of all the parameters in the model.
         """
         super(HybridDeviceOptimizer, self).zero_grad(set_to_none)
+        for optimizer in self.sub_optimizers:
+            optimizer.zero_grad(set_to_none)
         for group in self.param_groups:
             for param in group["params"]:
                 if hasattr(param, "decoupled_grad"):

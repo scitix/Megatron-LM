@@ -416,7 +416,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                 # fp32 params.
                 elif model_param.type() == 'torch.cuda.FloatTensor':
-                    shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
+                    # HybridDeviceOptimizer rebuilds torch optimizer param groups from these
+                    # shards. Wrap the shard view as a leaf Parameter so torch.optim accepts
+                    # trainable FP32 params kept by model-specific _keep_fp32 handling.
+                    shard_model_param = torch.nn.Parameter(
+                        model_param.detach().view(-1)[param_range.start : param_range.end],
+                        requires_grad=True,
+                    )
                     model_fp32_params_this_group.append(model_param)
                     shard_fp32_params_this_group.append(shard_model_param)
                     tensor_parallel.copy_tensor_model_parallel_attributes(

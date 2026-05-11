@@ -284,6 +284,7 @@ class GPTModel(LanguageModule):
         decoder_input: Tensor = None,
         inference_context: BaseInferenceContext = None,
         packed_seq_params: PackedSeqParams = None,
+        padding_mask: Optional[Tensor] = None,
     ):
         """Preprocesses inputs for the transformer decoder.
 
@@ -297,6 +298,12 @@ class GPTModel(LanguageModule):
         in_inference_mode = inference_context is not None and not self.training
 
         # Decoder embedding.
+        if padding_mask is not None:
+            assert padding_mask.shape == input_ids.shape, (
+                f"padding_mask shape {padding_mask.shape} does not match "
+                f"input_ids shape {input_ids.shape}"
+            )
+
         if decoder_input is not None:
             pass
         elif self.pre_process:
@@ -305,6 +312,15 @@ class GPTModel(LanguageModule):
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor
             decoder_input = None
+
+        if padding_mask is not None and self.config.sequence_parallel:
+            padding_mask = (
+                tensor_parallel.scatter_to_sequence_parallel_region(
+                    padding_mask.transpose(0, 1).contiguous()
+                )
+                .transpose(0, 1)
+                .contiguous()
+            )
 
         # Rotary positional embeddings (embedding is None for PP intermediate devices)
         rotary_pos_emb = None
@@ -403,13 +419,14 @@ class GPTModel(LanguageModule):
             rotary_pos_cos,
             rotary_pos_sin,
             sequence_len_offset,
+            padding_mask,
         )
         if rotary_pos_cos_sin is not None:
             # only in the case of flashinfer fused rope will we
             # return this extra tensor
             # this is for backwards compatibility with
             # legacy unit tests, which break if you
-            # return a 6 tuple instead of 5.
+            # return a 7 tuple instead of 6.
             preproc_output += (rotary_pos_cos_sin,)
 
         return preproc_output
@@ -446,6 +463,7 @@ class GPTModel(LanguageModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
         mtp_kwargs: Optional[dict] = {},
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
@@ -469,13 +487,19 @@ class GPTModel(LanguageModule):
             decoder_input=decoder_input,
             inference_context=inference_context,
             packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
         )
 
-        (decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset) = (
-            preproc_output[:5]
-        )
+        (
+            decoder_input,
+            rotary_pos_emb,
+            rotary_pos_cos,
+            rotary_pos_sin,
+            sequence_len_offset,
+            padding_mask,
+        ) = preproc_output[:6]
 
-        rotary_pos_cos_sin = preproc_output[5] if len(preproc_output) == 6 else None
+        rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
 
         # Run decoder.
         hidden_states = self.decoder(
@@ -488,6 +512,7 @@ class GPTModel(LanguageModule):
             rotary_pos_cos_sin=rotary_pos_cos_sin,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            padding_mask=padding_mask,
             input_ids=input_ids,
             **(extra_block_kwargs or {}),
         )
@@ -734,6 +759,7 @@ class GPTModel(LanguageModule):
         runtime_gather_output: Optional[bool] = None,
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
     ):
         """Builds a computation schedule plan for the model.
 
@@ -759,6 +785,7 @@ class GPTModel(LanguageModule):
             inference_params (InferenceParams, optional):
                 Parameters for inference. Defaults to None.
             loss_mask (Optional[Tensor], optional): Loss mask. Defaults to None.
+            padding_mask (Optional[Tensor], optional): Padding mask. Defaults to None.
 
         Returns:
             TransformerModelChunkSchedulePlan: The model chunk schedule plan.
@@ -780,6 +807,7 @@ class GPTModel(LanguageModule):
             extra_block_kwargs,
             runtime_gather_output,
             loss_mask,
+            padding_mask,
         )
 
     def sharded_state_dict(
