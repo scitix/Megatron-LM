@@ -222,39 +222,50 @@ class TopKRouter(Router):
         routing_replay_manager.register_to_module(self, "routing_replay")
         self._routing_replay_registered = hasattr(self, "routing_replay")
 
+    def _set_expert_bias_buffers(self, enabled: bool):
+        if enabled:
+            local_tokens_per_expert = torch.zeros(
+                self.config.num_moe_experts,
+                dtype=torch.float32,
+                device=torch.cuda.current_device(),
+            )
+            expert_bias = torch.zeros(
+                self.config.num_moe_experts,
+                dtype=torch.float32,
+                device=torch.cuda.current_device(),
+            )
+        else:
+            local_tokens_per_expert = None
+            expert_bias = None
+
+        if 'local_tokens_per_expert' in self._buffers:
+            self.local_tokens_per_expert = local_tokens_per_expert
+        else:
+            self.register_buffer(
+                'local_tokens_per_expert',
+                local_tokens_per_expert,
+                persistent=False,
+            )
+
+        if 'expert_bias' in self._buffers:
+            self.expert_bias = expert_bias
+        else:
+            self.register_buffer('expert_bias', expert_bias)
+
     def _init_routing_mode(self, layer_number):
         assert not self._routing_mode_initialized
         self._routing_mode_initialized = True
 
-        if not self.config.dsv4_mode:
-            return
-
-        mode_hash = layer_number <= self.config.dsv4_n_hash_layers and not self.is_mtp
+        mode_hash = (
+            self.config.dsv4_mode
+            and layer_number <= self.config.dsv4_n_hash_layers
+            and not self.is_mtp
+        )
 
         self.enable_expert_bias = (
             self.config.moe_router_enable_expert_bias and not mode_hash
         )
-        if self.enable_expert_bias and not hasattr(self, 'local_tokens_per_expert'):
-            self.register_buffer(
-                'local_tokens_per_expert',
-                torch.zeros(
-                    self.config.num_moe_experts,
-                    dtype=torch.float32,
-                    device=torch.cuda.current_device(),
-                ),
-                persistent=False,
-            )
-            self.register_buffer(
-                'expert_bias',
-                torch.zeros(
-                    self.config.num_moe_experts,
-                    dtype=torch.float32,
-                    device=torch.cuda.current_device(),
-                ),
-            )
-        elif not self.enable_expert_bias:
-            self.register_buffer('local_tokens_per_expert', None, persistent=False)
-            self.register_buffer('expert_bias', None)
+        self._set_expert_bias_buffers(self.enable_expert_bias)
 
         if mode_hash:
             self.tid2eid = torch.nn.Parameter(
@@ -279,6 +290,8 @@ class TopKRouter(Router):
         # prefix and leave all MTP tid2eid entries at -1.
         del self.tid2eid
         self.tid2eid = None
+        self.enable_expert_bias = self.config.moe_router_enable_expert_bias
+        self._set_expert_bias_buffers(self.enable_expert_bias)
 
     def set_layer_number(self, layer_number: int):
         """Set the layer number and initialize DSV4 routing mode."""
