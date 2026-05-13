@@ -134,9 +134,12 @@ def _maybe_fake_mxfp4_expert_qat_main_param_shard(
 
     from megatron.core.extensions.transformer_engine import fake_mxfp4_quantization_ste
 
-    return fake_mxfp4_quantization_ste(main_param.view(-1, block_size), block_size).view_as(
-        main_param
-    )
+    fake_main_param = fake_mxfp4_quantization_ste(
+        main_param.view(-1, block_size), block_size
+    ).view_as(main_param)
+    if hasattr(main_param, "main_grad"):
+        fake_main_param.main_grad = main_param.main_grad
+    return fake_main_param
 
 
 def is_float8tensor(tensor: torch.Tensor) -> bool:
