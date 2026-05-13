@@ -1482,6 +1482,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
             for param in self.parameters():
                 setattr(param, "allreduce", not (is_expert and self.expert_parallel))
+                if is_expert and param.dim() == 2:
+                    setattr(param, "mcore_mxfp4_expert_qat_weight", True)
+                    setattr(param, "mcore_mxfp4_expert_qat_shape", tuple(param.shape))
 
             def merge_extra_states(
                 self,
@@ -1610,7 +1613,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     fake_int4_quantization_ste(w, group_size)
                     for w in weight_tensors
                 ]
-            elif mxfp4_enabled:
+            elif mxfp4_enabled and not self.config.fp8_param:
+                # With fp8_param_gather, the high-precision main param is
+                # fake-quantized before casting into the TE FP8 compute param.
+                # Reapplying fake MXFP4 here would quantize the already-FP8
+                # forward tensor and would not represent the rollout format.
                 # MXFP4 spec fixes block size at 32; env is overridable for ablations.
                 block_size = int(os.getenv("OPEN_TRAINING_MXFP4_BLOCK_SIZE", "32"))
                 weight_tensors = [

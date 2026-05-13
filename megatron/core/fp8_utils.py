@@ -3,6 +3,7 @@
 """Utility functions related to FP8 that are used throughout Megatron core"""
 
 import importlib
+import os
 import weakref
 from contextlib import nullcontext
 from functools import wraps
@@ -91,6 +92,51 @@ try:
     )
 except ImportError:
     te_post_all_gather_processing = None
+
+
+def _maybe_fake_mxfp4_expert_qat_main_param_shard(
+    model_param: torch.Tensor,
+    main_param: Optional[torch.Tensor],
+    start_offset: Optional[int],
+) -> Optional[torch.Tensor]:
+    if main_param is None:
+        return None
+    if os.getenv("OPEN_TRAINING_MXFP4_FAKE_QAT_FLAG", "0") != "1":
+        return main_param
+    if not getattr(model_param, "mcore_mxfp4_expert_qat_weight", False):
+        return main_param
+
+    block_size = int(os.getenv("OPEN_TRAINING_MXFP4_BLOCK_SIZE", "32"))
+    if block_size <= 0:
+        raise RuntimeError(
+            "OPEN_TRAINING_MXFP4_BLOCK_SIZE must be a positive integer when "
+            "OPEN_TRAINING_MXFP4_FAKE_QAT_FLAG=1."
+        )
+
+    weight_shape = getattr(
+        model_param, "mcore_mxfp4_expert_qat_shape", tuple(model_param.shape)
+    )
+    if len(weight_shape) != 2 or weight_shape[-1] % block_size != 0:
+        raise RuntimeError(
+            "MXFP4 expert QAT with fp8_param_gather requires a 2D expert weight "
+            f"whose K dimension is divisible by block size {block_size}; got {weight_shape}."
+        )
+    if start_offset is None:
+        raise RuntimeError(
+            "MXFP4 expert QAT with fp8_param_gather requires shard start offsets."
+        )
+    if start_offset % block_size != 0 or main_param.numel() % block_size != 0:
+        raise RuntimeError(
+            "MXFP4 expert QAT with fp8_param_gather requires optimizer shards "
+            f"aligned to group-{block_size} boundaries; got start_offset={start_offset}, "
+            f"numel={main_param.numel()}."
+        )
+
+    from megatron.core.extensions.transformer_engine import fake_mxfp4_quantization_ste
+
+    return fake_mxfp4_quantization_ste(main_param.view(-1, block_size), block_size).view_as(
+        main_param
+    )
 
 
 def is_float8tensor(tensor: torch.Tensor) -> bool:
@@ -242,15 +288,15 @@ if HAVE_TE and is_te_min_version("2.2"):
 
         from transformer_engine.pytorch.tensor.utils import cast_master_weights_to_fp8
 
-        args = [model_params, main_params, start_offsets, data_parallel_group]
         if fsdp_shard_model_params is not None:
             if not HAVE_PACKAGING:
                 raise ImportError(
                     "packaging not found, please install it with `pip install packaging`"
                 )
-            if get_te_version() == PkgVersion("2.3.0.dev0+5fdd7bb") or is_te_min_version("2.3.0"):
-                args.append(fsdp_shard_model_params)
-            else:
+            if not (
+                get_te_version() == PkgVersion("2.3.0.dev0+5fdd7bb")
+                or is_te_min_version("2.3.0")
+            ):
                 raise NotImplementedError(
                     f"FSDP with --fp8-param-gather is not supported in TE v{get_te_version()}"
                 )
@@ -262,6 +308,17 @@ if HAVE_TE and is_te_min_version("2.2"):
         if te_post_all_gather_processing is not None:
             kwargs["manual_post_all_gather_processing"] = True
 
+        main_params = [
+            _maybe_fake_mxfp4_expert_qat_main_param_shard(
+                model_param, main_param, start_offset
+            )
+            for model_param, main_param, start_offset in zip(
+                model_params, main_params, start_offsets
+            )
+        ]
+        args = [model_params, main_params, start_offsets, data_parallel_group]
+        if fsdp_shard_model_params is not None:
+            args.append(fsdp_shard_model_params)
         cast_master_weights_to_fp8(*args, **kwargs)
 
     def _correct_amax_history_if_needed_impl(model: List[torch.nn.Module]) -> None:
@@ -311,6 +368,9 @@ elif HAVE_TE and is_te_min_version("2.0"):
                 ]
 
             quantizer = model_param._quantizer
+            main_param = _maybe_fake_mxfp4_expert_qat_main_param_shard(
+                model_param, main_param, start_offset
+            )
             # When not using --fp8-param-gather, the main_param (fp32) is first cast to bf16/fp16,
             # and then cast to fp8 during forward.
             # Although it's not necessary when --fp8-param-gather is enabled, we still keep this
@@ -404,6 +464,9 @@ elif HAVE_TE and is_te_min_version("1.0"):
             # and then cast to fp8 during forward.
             # Although it's not necessary when --fp8-param-gather is enabled, we still keep this
             # logic to keep numerical consistency. So here cast the main_param to model_param.dtype.
+            main_param = _maybe_fake_mxfp4_expert_qat_main_param_shard(
+                model_param, main_param, start_offset
+            )
             main_param = main_param.to(model_param.dtype)
             cast_to_fp8(
                 main_param.view(1, -1),
