@@ -3,6 +3,7 @@
 """Utility functions related to FP8 that are used throughout Megatron core"""
 
 import importlib
+import json
 import os
 import weakref
 from contextlib import nullcontext
@@ -167,6 +168,101 @@ def dequantize_fp8_tensor(fp8_tensor: torch.Tensor) -> torch.Tensor:
         return fp8_tensor.from_float8()
 
 
+_MXFP4_QAT_FP8_COPY_TRACE_REMAINING = None
+
+
+def _mxfp4_qat_fp8_copy_trace_remaining() -> int:
+    global _MXFP4_QAT_FP8_COPY_TRACE_REMAINING
+    if _MXFP4_QAT_FP8_COPY_TRACE_REMAINING is None:
+        raw_limit = os.getenv("SIRL_DSV4_QAT_FP8_COPY_TRACE_LIMIT", "")
+        _MXFP4_QAT_FP8_COPY_TRACE_REMAINING = int(raw_limit) if raw_limit else 0
+    return _MXFP4_QAT_FP8_COPY_TRACE_REMAINING
+
+
+def _decrement_mxfp4_qat_fp8_copy_trace_remaining() -> None:
+    global _MXFP4_QAT_FP8_COPY_TRACE_REMAINING
+    _MXFP4_QAT_FP8_COPY_TRACE_REMAINING = max(
+        0, _mxfp4_qat_fp8_copy_trace_remaining() - 1
+    )
+
+
+class _TraceFormatDict(dict):
+    def __missing__(self, key):
+        return "unknown"
+
+
+def _trace_rank() -> str:
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return str(torch.distributed.get_rank())
+    except RuntimeError:
+        pass
+    return os.getenv("RANK", "unknown")
+
+
+def _format_mxfp4_qat_fp8_copy_trace_path(path_template: str) -> str:
+    return path_template.format_map(
+        _TraceFormatDict(rank=_trace_rank(), pid=str(os.getpid()))
+    )
+
+
+def _maybe_record_mxfp4_qat_fp8_copy_trace(
+    model_param: torch.Tensor,
+    fake_main_param: Optional[torch.Tensor],
+    start_offset: Optional[int],
+) -> None:
+    """Trace fake-MXFP4 main-param -> TE FP8 compute-param loss.
+
+    This is disabled by default. It is intentionally train-side: rollout export
+    tracing proves TE-FP8-export -> native-FP4 pack/dequant, while this hook
+    measures the earlier copy boundary where QAT feeds fake FP4 weights into TE
+    blockwise FP8 compute params.
+    """
+    path_template = os.getenv("SIRL_DSV4_QAT_FP8_COPY_TRACE_PATH", "")
+    if not path_template or _mxfp4_qat_fp8_copy_trace_remaining() <= 0:
+        return
+    if fake_main_param is None:
+        return
+    if os.getenv("OPEN_TRAINING_MXFP4_FAKE_QAT_FLAG", "0") != "1":
+        return
+    if not getattr(model_param, "mcore_mxfp4_expert_qat_weight", False):
+        return
+    if start_offset is None:
+        return
+
+    with torch.no_grad():
+        expected = fake_main_param.detach().float().reshape(-1)
+        dequantized_model = dequantize_fp8_tensor(model_param).detach().float().reshape(-1)
+        actual = dequantized_model.narrow(0, int(start_offset), expected.numel())
+        diff = actual - expected
+        max_abs_error = diff.abs().max()
+        rmse = diff.pow(2).mean().sqrt()
+        expected_rmse = expected.pow(2).mean().sqrt().clamp_min(1e-12)
+        record = {
+            "schema": "dsv4_mxfp4_qat_fp8_copy_trace.v1",
+            "rank": _trace_rank(),
+            "pid": os.getpid(),
+            "start_offset": int(start_offset),
+            "numel": int(expected.numel()),
+            "model_shape": list(getattr(model_param, "shape", ())),
+            "main_param_shape": list(fake_main_param.shape),
+            "model_param_type": f"{type(model_param).__module__}.{type(model_param).__qualname__}",
+            "model_param_dtype": str(getattr(model_param, "dtype", None)),
+            "fake_main_param_dtype": str(fake_main_param.dtype),
+            "max_abs_error": float(max_abs_error.cpu()),
+            "rmse": float(rmse.cpu()),
+            "relative_rmse": float((rmse / expected_rmse).cpu()),
+            "expected_absmax": float(expected.abs().max().cpu()),
+            "actual_absmax": float(actual.abs().max().cpu()),
+        }
+
+    path = _format_mxfp4_qat_fp8_copy_trace_path(path_template)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+    _decrement_mxfp4_qat_fp8_copy_trace_remaining()
+
+
 def _resolve_callable_from_python_import_path(dotted_path: str):
     """Resolve a Python import path like 'pkg.mod.func' to a callable.
 
@@ -323,6 +419,10 @@ if HAVE_TE and is_te_min_version("2.2"):
         if fsdp_shard_model_params is not None:
             args.append(fsdp_shard_model_params)
         cast_master_weights_to_fp8(*args, **kwargs)
+        for model_param, main_param, start_offset in zip(
+            model_params, main_params, start_offsets
+        ):
+            _maybe_record_mxfp4_qat_fp8_copy_trace(model_param, main_param, start_offset)
 
     def _correct_amax_history_if_needed_impl(model: List[torch.nn.Module]) -> None:
         pass
@@ -374,6 +474,7 @@ elif HAVE_TE and is_te_min_version("2.0"):
             main_param = _maybe_fake_mxfp4_expert_qat_main_param_shard(
                 model_param, main_param, start_offset
             )
+            trace_main_param = main_param
             # When not using --fp8-param-gather, the main_param (fp32) is first cast to bf16/fp16,
             # and then cast to fp8 during forward.
             # Although it's not necessary when --fp8-param-gather is enabled, we still keep this
@@ -389,6 +490,9 @@ elif HAVE_TE and is_te_min_version("2.0"):
                 quantizer=quantizer,
             )
             quantizer.update_quantized(main_param, out)
+            _maybe_record_mxfp4_qat_fp8_copy_trace(
+                model_param, trace_main_param, start_offset
+            )
 
         amaxes = []
         scales = []
@@ -470,6 +574,7 @@ elif HAVE_TE and is_te_min_version("1.0"):
             main_param = _maybe_fake_mxfp4_expert_qat_main_param_shard(
                 model_param, main_param, start_offset
             )
+            trace_main_param = main_param
             main_param = main_param.to(model_param.dtype)
             cast_to_fp8(
                 main_param.view(1, -1),
@@ -477,6 +582,9 @@ elif HAVE_TE and is_te_min_version("1.0"):
                 model_param._fp8_meta_index,
                 model_param._fp8_dtype,
                 out=shard_model_param.view(1, -1),
+            )
+            _maybe_record_mxfp4_qat_fp8_copy_trace(
+                model_param, trace_main_param, start_offset
             )
 
         amaxes = []
