@@ -169,6 +169,9 @@ def dequantize_fp8_tensor(fp8_tensor: torch.Tensor) -> torch.Tensor:
 
 
 _MXFP4_QAT_FP8_COPY_TRACE_REMAINING = None
+_MXFP4_QAT_FP8_COPY_TRACE_CALL_INDEX = 0
+_MXFP4_QAT_FP8_COPY_TRACE_RECORD_INDEX = 0
+_MXFP4_QAT_FP8_COPY_TRACE_COUNTS_BY_CALL: dict[int, int] = {}
 
 
 def _mxfp4_qat_fp8_copy_trace_remaining() -> int:
@@ -186,6 +189,41 @@ def _decrement_mxfp4_qat_fp8_copy_trace_remaining() -> None:
     )
 
 
+def _next_mxfp4_qat_fp8_copy_trace_call_index() -> int:
+    global _MXFP4_QAT_FP8_COPY_TRACE_CALL_INDEX
+    _MXFP4_QAT_FP8_COPY_TRACE_CALL_INDEX += 1
+    return _MXFP4_QAT_FP8_COPY_TRACE_CALL_INDEX
+
+
+def _mxfp4_qat_fp8_copy_trace_limit_per_call() -> Optional[int]:
+    raw_limit = os.getenv("SIRL_DSV4_QAT_FP8_COPY_TRACE_LIMIT_PER_CALL", "")
+    return int(raw_limit) if raw_limit else None
+
+
+def _should_record_mxfp4_qat_fp8_copy_trace(copy_call_index: int) -> bool:
+    per_call_limit = _mxfp4_qat_fp8_copy_trace_limit_per_call()
+    if per_call_limit is None:
+        return _mxfp4_qat_fp8_copy_trace_remaining() > 0
+
+    count = _MXFP4_QAT_FP8_COPY_TRACE_COUNTS_BY_CALL.get(copy_call_index, 0)
+    return count < per_call_limit
+
+
+def _mark_recorded_mxfp4_qat_fp8_copy_trace(copy_call_index: int) -> int:
+    global _MXFP4_QAT_FP8_COPY_TRACE_RECORD_INDEX
+    record_index = _MXFP4_QAT_FP8_COPY_TRACE_RECORD_INDEX
+    _MXFP4_QAT_FP8_COPY_TRACE_RECORD_INDEX += 1
+
+    per_call_limit = _mxfp4_qat_fp8_copy_trace_limit_per_call()
+    if per_call_limit is None:
+        _decrement_mxfp4_qat_fp8_copy_trace_remaining()
+    else:
+        _MXFP4_QAT_FP8_COPY_TRACE_COUNTS_BY_CALL[copy_call_index] = (
+            _MXFP4_QAT_FP8_COPY_TRACE_COUNTS_BY_CALL.get(copy_call_index, 0) + 1
+        )
+    return record_index
+
+
 class _TraceFormatDict(dict):
     def __missing__(self, key):
         return "unknown"
@@ -200,9 +238,19 @@ def _trace_rank() -> str:
     return os.getenv("RANK", "unknown")
 
 
-def _format_mxfp4_qat_fp8_copy_trace_path(path_template: str) -> str:
+def _format_mxfp4_qat_fp8_copy_trace_path(
+    path_template: str,
+    *,
+    copy_call_index: int,
+    record_index: int,
+) -> str:
     return path_template.format_map(
-        _TraceFormatDict(rank=_trace_rank(), pid=str(os.getpid()))
+        _TraceFormatDict(
+            rank=_trace_rank(),
+            pid=str(os.getpid()),
+            copy_call=str(copy_call_index),
+            trace_index=str(record_index),
+        )
     )
 
 
@@ -210,6 +258,7 @@ def _maybe_record_mxfp4_qat_fp8_copy_trace(
     model_param: torch.Tensor,
     fake_main_param: Optional[torch.Tensor],
     start_offset: Optional[int],
+    copy_call_index: int,
 ) -> None:
     """Trace fake-MXFP4 main-param -> TE FP8 compute-param loss.
 
@@ -219,7 +268,7 @@ def _maybe_record_mxfp4_qat_fp8_copy_trace(
     blockwise FP8 compute params.
     """
     path_template = os.getenv("SIRL_DSV4_QAT_FP8_COPY_TRACE_PATH", "")
-    if not path_template or _mxfp4_qat_fp8_copy_trace_remaining() <= 0:
+    if not path_template or not _should_record_mxfp4_qat_fp8_copy_trace(copy_call_index):
         return
     if fake_main_param is None:
         return
@@ -238,10 +287,15 @@ def _maybe_record_mxfp4_qat_fp8_copy_trace(
         max_abs_error = diff.abs().max()
         rmse = diff.pow(2).mean().sqrt()
         expected_rmse = expected.pow(2).mean().sqrt().clamp_min(1e-12)
+        actual_rmse = actual.pow(2).mean().sqrt()
+        record_index = _mark_recorded_mxfp4_qat_fp8_copy_trace(copy_call_index)
         record = {
             "schema": "dsv4_mxfp4_qat_fp8_copy_trace.v1",
+            "trace_index": record_index,
+            "copy_call_index": copy_call_index,
             "rank": _trace_rank(),
             "pid": os.getpid(),
+            "param_name": getattr(model_param, "mcore_mxfp4_expert_qat_name", None),
             "start_offset": int(start_offset),
             "numel": int(expected.numel()),
             "model_shape": list(getattr(model_param, "shape", ())),
@@ -254,13 +308,20 @@ def _maybe_record_mxfp4_qat_fp8_copy_trace(
             "relative_rmse": float((rmse / expected_rmse).cpu()),
             "expected_absmax": float(expected.abs().max().cpu()),
             "actual_absmax": float(actual.abs().max().cpu()),
+            "expected_mean": float(expected.mean().cpu()),
+            "actual_mean": float(actual.mean().cpu()),
+            "expected_rms": float(expected_rmse.cpu()),
+            "actual_rms": float(actual_rmse.cpu()),
         }
 
-    path = _format_mxfp4_qat_fp8_copy_trace_path(path_template)
+    path = _format_mxfp4_qat_fp8_copy_trace_path(
+        path_template,
+        copy_call_index=copy_call_index,
+        record_index=record_index,
+    )
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, sort_keys=True) + "\n")
-    _decrement_mxfp4_qat_fp8_copy_trace_remaining()
 
 
 def _resolve_callable_from_python_import_path(dotted_path: str):
@@ -386,6 +447,7 @@ if HAVE_TE and is_te_min_version("2.2"):
             return
 
         from transformer_engine.pytorch.tensor.utils import cast_master_weights_to_fp8
+        copy_call_index = _next_mxfp4_qat_fp8_copy_trace_call_index()
 
         if fsdp_shard_model_params is not None:
             if not HAVE_PACKAGING:
@@ -422,7 +484,9 @@ if HAVE_TE and is_te_min_version("2.2"):
         for model_param, main_param, start_offset in zip(
             model_params, main_params, start_offsets
         ):
-            _maybe_record_mxfp4_qat_fp8_copy_trace(model_param, main_param, start_offset)
+            _maybe_record_mxfp4_qat_fp8_copy_trace(
+                model_param, main_param, start_offset, copy_call_index
+            )
 
     def _correct_amax_history_if_needed_impl(model: List[torch.nn.Module]) -> None:
         pass
@@ -457,6 +521,7 @@ elif HAVE_TE and is_te_min_version("2.0"):
         if fsdp_shard_model_params is None:
             fsdp_shard_model_params = [None] * len(model_params)
 
+        copy_call_index = _next_mxfp4_qat_fp8_copy_trace_call_index()
         for model_param, main_param, start_offset, fsdp_shard_model_param in zip(
             model_params, main_params, start_offsets, fsdp_shard_model_params
         ):
@@ -491,7 +556,7 @@ elif HAVE_TE and is_te_min_version("2.0"):
             )
             quantizer.update_quantized(main_param, out)
             _maybe_record_mxfp4_qat_fp8_copy_trace(
-                model_param, trace_main_param, start_offset
+                model_param, trace_main_param, start_offset, copy_call_index
             )
 
         amaxes = []
