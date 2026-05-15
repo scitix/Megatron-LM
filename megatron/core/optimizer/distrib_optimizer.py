@@ -2,10 +2,11 @@
 
 """Megatron distributed optimizer."""
 
-
 import gc
 import itertools
+import os
 from collections import ChainMap
+from contextlib import nullcontext
 from dataclasses import replace
 from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -56,13 +57,39 @@ from .optimizer_config import OptimizerConfig
 # SparseRL-Sync integration: init_sparse_manager binds the optimizer's shard
 # views to a SparseManager that tracks per-rollout dp-local diff indices.
 # sparse_diff_context wraps the in-place shard_model_param.copy_() that
-# realises the new training weights. Both fall back to no-ops when
-# sparse_update is not importable so the upstream behaviour is preserved.
-try:
-    from sparse_update import init_sparse_manager, sparse_diff_context
-except ImportError:
-    from contextlib import nullcontext
+# realises the new training weights. The package is imported only when
+# SPARSERL_STATE explicitly enables SparseRL-Sync.
+_SPARSERL_DISABLED_STATES = {"", "0", "false", "none", "off", "disable", "disabled"}
+_SPARSERL_ENABLED_STATES = {
+    "observe",
+    "update",
+    "update_and_validate",
+    "update_and_observe",
+    "update_and_validate_and_observe",
+}
 
+
+def _sparserl_state_enabled():
+    value = os.getenv("SPARSERL_STATE", "").strip().lower()
+    if value in _SPARSERL_DISABLED_STATES:
+        return False
+    if value in _SPARSERL_ENABLED_STATES:
+        return True
+    expected = ", ".join(sorted(_SPARSERL_ENABLED_STATES))
+    raise RuntimeError(
+        f"Invalid SPARSERL_STATE={value!r}. Expected one of: {expected}; "
+        "unset, none, false, or off disables SparseRL-Sync."
+    )
+
+
+if _sparserl_state_enabled():
+    try:
+        from sparse_update import init_sparse_manager, sparse_diff_context
+    except ImportError as exc:
+        raise RuntimeError(
+            "SPARSERL_STATE enables SparseRL-Sync, but sparse_update is not importable."
+        ) from exc
+else:
     def sparse_diff_context(*args, **kwargs):
         return nullcontext()
 

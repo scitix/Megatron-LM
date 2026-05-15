@@ -1,17 +1,46 @@
 # Copyright (c) 2025, NVIDIA CORPORATION and Alibaba PAI. All rights reserved.
+import os
 from collections import defaultdict
+from contextlib import nullcontext
 from typing import Dict
 
 import torch
 
 # SparseRL-Sync integration: sparse_diff_context wraps the param.copy_() so the
 # attached SparseManager can snapshot pre-state, then diff against post-state to
-# build per-param sparse-update indices. Falls back to nullcontext when the
-# sparse_update package is not installed so the upstream behavior is unchanged.
-try:
-    from sparse_update import sparse_diff_context
-except ImportError:
-    from contextlib import nullcontext
+# build per-param sparse-update indices. The package is imported only when
+# SPARSERL_STATE explicitly enables SparseRL-Sync.
+_SPARSERL_DISABLED_STATES = {"", "0", "false", "none", "off", "disable", "disabled"}
+_SPARSERL_ENABLED_STATES = {
+    "observe",
+    "update",
+    "update_and_validate",
+    "update_and_observe",
+    "update_and_validate_and_observe",
+}
+
+
+def _sparserl_state_enabled():
+    value = os.getenv("SPARSERL_STATE", "").strip().lower()
+    if value in _SPARSERL_DISABLED_STATES:
+        return False
+    if value in _SPARSERL_ENABLED_STATES:
+        return True
+    expected = ", ".join(sorted(_SPARSERL_ENABLED_STATES))
+    raise RuntimeError(
+        f"Invalid SPARSERL_STATE={value!r}. Expected one of: {expected}; "
+        "unset, none, false, or off disables SparseRL-Sync."
+    )
+
+
+if _sparserl_state_enabled():
+    try:
+        from sparse_update import sparse_diff_context
+    except ImportError as exc:
+        raise RuntimeError(
+            "SPARSERL_STATE enables SparseRL-Sync, but sparse_update is not importable."
+        ) from exc
+else:
 
     def sparse_diff_context(*args, **kwargs):
         return nullcontext()
