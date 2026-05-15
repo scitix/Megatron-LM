@@ -619,6 +619,7 @@ elif HAVE_TE and is_te_min_version("1.0"):
         if fsdp_shard_model_params is None:
             fsdp_shard_model_params = [None] * len(model_params)
 
+        copy_call_index = _next_mxfp4_qat_fp8_copy_trace_call_index()
         for model_param, main_param, start_offset, fsdp_shard_model_param in zip(
             model_params, main_params, start_offsets, fsdp_shard_model_params
         ):
@@ -649,7 +650,7 @@ elif HAVE_TE and is_te_min_version("1.0"):
                 out=shard_model_param.view(1, -1),
             )
             _maybe_record_mxfp4_qat_fp8_copy_trace(
-                model_param, trace_main_param, start_offset
+                model_param, trace_main_param, start_offset, copy_call_index
             )
 
         amaxes = []
