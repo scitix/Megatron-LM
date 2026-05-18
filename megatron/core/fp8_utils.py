@@ -4,6 +4,7 @@
 
 import importlib
 import json
+import math
 import os
 import weakref
 from contextlib import nullcontext
@@ -172,6 +173,8 @@ _MXFP4_QAT_FP8_COPY_TRACE_REMAINING = None
 _MXFP4_QAT_FP8_COPY_TRACE_CALL_INDEX = 0
 _MXFP4_QAT_FP8_COPY_TRACE_RECORD_INDEX = 0
 _MXFP4_QAT_FP8_COPY_TRACE_COUNTS_BY_CALL: dict[int, int] = {}
+_MXFP4_E2M1_POS_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_MXFP4_E2M1_BOUNDARIES = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
 
 
 def _mxfp4_qat_fp8_copy_trace_remaining() -> int:
@@ -198,6 +201,102 @@ def _next_mxfp4_qat_fp8_copy_trace_call_index() -> int:
 def _mxfp4_qat_fp8_copy_trace_limit_per_call() -> Optional[int]:
     raw_limit = os.getenv("SIRL_DSV4_QAT_FP8_COPY_TRACE_LIMIT_PER_CALL", "")
     return int(raw_limit) if raw_limit else None
+
+
+def _mxfp4_qat_fp8_copy_trace_sample_elems() -> int:
+    raw_limit = os.getenv("SIRL_DSV4_QAT_FP8_COPY_TRACE_SAMPLE_ELEMS", "")
+    return int(raw_limit) if raw_limit else 0
+
+
+def _evenly_spaced_indices(numel: int, limit: int) -> List[int]:
+    if numel <= 0 or limit <= 0:
+        return []
+    if limit >= numel:
+        return list(range(numel))
+    if limit == 1:
+        return [0]
+    return sorted({round(index * (numel - 1) / (limit - 1)) for index in range(limit)})
+
+
+def _mxfp4_e2m1_code(value: float) -> int:
+    mag = abs(value)
+    code = 0
+    for boundary in _MXFP4_E2M1_BOUNDARIES:
+        if mag > boundary:
+            code += 1
+        elif mag == boundary and code % 2 == 1:
+            code += 1
+        else:
+            break
+    return min(code, len(_MXFP4_E2M1_POS_GRID) - 1)
+
+
+def _nearest_mxfp4_boundary_distance(value: float) -> dict[str, float]:
+    mag = abs(value)
+    boundary = min(_MXFP4_E2M1_BOUNDARIES, key=lambda candidate: abs(mag - candidate))
+    return {
+        "nearest_e2m1_boundary": boundary,
+        "nearest_e2m1_boundary_distance": abs(mag - boundary),
+    }
+
+
+def _sample_mxfp4_qat_fp8_copy_boundary(
+    *,
+    raw_main_param: torch.Tensor,
+    fake_main_param: torch.Tensor,
+    actual: torch.Tensor,
+    block_size: int,
+    sample_elems: int,
+) -> List[dict[str, object]]:
+    raw_flat = raw_main_param.detach().float().reshape(-1)
+    fake_flat = fake_main_param.detach().float().reshape(-1)
+    actual_flat = actual.detach().float().reshape(-1)
+    if raw_flat.numel() != fake_flat.numel() or raw_flat.numel() != actual_flat.numel():
+        raise RuntimeError(
+            "MXFP4 QAT FP8-copy sample trace requires raw/fake/actual numel equality: "
+            f"raw={raw_flat.numel()} fake={fake_flat.numel()} actual={actual_flat.numel()}"
+        )
+    if raw_flat.numel() % block_size != 0:
+        raise RuntimeError(
+            "MXFP4 QAT FP8-copy sample trace requires shard numel aligned to block size: "
+            f"numel={raw_flat.numel()} block_size={block_size}"
+        )
+
+    samples: List[dict[str, object]] = []
+    for flat_index in _evenly_spaced_indices(raw_flat.numel(), sample_elems):
+        group_start = (flat_index // block_size) * block_size
+        group_end = group_start + block_size
+        raw_value = float(raw_flat[flat_index].cpu())
+        fake_value = float(fake_flat[flat_index].cpu())
+        actual_value = float(actual_flat[flat_index].cpu())
+        group_absmax = float(raw_flat[group_start:group_end].abs().max().cpu())
+        scale_exponent = math.ceil(math.log2(max(group_absmax / 6.0, 1e-8)))
+        scale_exponent = min(127, max(-127, scale_exponent))
+        scale_value = float(2.0 ** scale_exponent)
+        raw_over_scale = raw_value / scale_value
+        fake_over_scale = fake_value / scale_value
+        actual_over_scale = actual_value / scale_value
+        samples.append(
+            {
+                "flat_index": int(flat_index),
+                "group_start": int(group_start),
+                "group_end": int(group_end),
+                "block_size": int(block_size),
+                "scale_exponent": int(scale_exponent),
+                "scale_value": scale_value,
+                "group_absmax": group_absmax,
+                "raw_value": raw_value,
+                "fake_value": fake_value,
+                "actual_value": actual_value,
+                "raw_over_scale": raw_over_scale,
+                "fake_over_scale": fake_over_scale,
+                "actual_over_scale": actual_over_scale,
+                "raw_e2m1_code": _mxfp4_e2m1_code(raw_over_scale),
+                "fake_e2m1_code": _mxfp4_e2m1_code(fake_over_scale),
+                **_nearest_mxfp4_boundary_distance(raw_over_scale),
+            }
+        )
+    return samples
 
 
 def _should_record_mxfp4_qat_fp8_copy_trace(copy_call_index: int) -> bool:
@@ -257,6 +356,7 @@ def _format_mxfp4_qat_fp8_copy_trace_path(
 def _maybe_record_mxfp4_qat_fp8_copy_trace(
     model_param: torch.Tensor,
     fake_main_param: Optional[torch.Tensor],
+    raw_main_param: Optional[torch.Tensor],
     start_offset: Optional[int],
     copy_call_index: int,
 ) -> None:
@@ -278,9 +378,17 @@ def _maybe_record_mxfp4_qat_fp8_copy_trace(
         return
     if start_offset is None:
         return
+    if raw_main_param is None:
+        return
 
     with torch.no_grad():
         expected = fake_main_param.detach().float().reshape(-1)
+        raw = raw_main_param.detach().float().reshape(-1)
+        if raw.numel() != expected.numel():
+            raise RuntimeError(
+                "MXFP4 QAT FP8-copy trace requires raw and fake main-param shards "
+                f"with matching numel, got raw={raw.numel()} fake={expected.numel()}."
+            )
         dequantized_model = dequantize_fp8_tensor(model_param).detach().float().reshape(-1)
         actual = dequantized_model.narrow(0, int(start_offset), expected.numel())
         diff = actual - expected
@@ -313,6 +421,18 @@ def _maybe_record_mxfp4_qat_fp8_copy_trace(
             "expected_rms": float(expected_rmse.cpu()),
             "actual_rms": float(actual_rmse.cpu()),
         }
+        sample_elems = _mxfp4_qat_fp8_copy_trace_sample_elems()
+        if sample_elems:
+            block_size = int(os.getenv("OPEN_TRAINING_MXFP4_BLOCK_SIZE", "32"))
+            record["e2m1_positive_grid"] = list(_MXFP4_E2M1_POS_GRID)
+            record["e2m1_boundaries"] = list(_MXFP4_E2M1_BOUNDARIES)
+            record["sampled_main_param_values"] = _sample_mxfp4_qat_fp8_copy_boundary(
+                raw_main_param=raw,
+                fake_main_param=expected,
+                actual=actual,
+                block_size=block_size,
+                sample_elems=sample_elems,
+            )
 
     path = _format_mxfp4_qat_fp8_copy_trace_path(
         path_template,
@@ -469,6 +589,7 @@ if HAVE_TE and is_te_min_version("2.2"):
         if te_post_all_gather_processing is not None:
             kwargs["manual_post_all_gather_processing"] = True
 
+        raw_main_params = main_params
         main_params = [
             _maybe_fake_mxfp4_expert_qat_main_param_shard(
                 model_param, main_param, start_offset
@@ -481,11 +602,11 @@ if HAVE_TE and is_te_min_version("2.2"):
         if fsdp_shard_model_params is not None:
             args.append(fsdp_shard_model_params)
         cast_master_weights_to_fp8(*args, **kwargs)
-        for model_param, main_param, start_offset in zip(
-            model_params, main_params, start_offsets
+        for model_param, main_param, raw_main_param, start_offset in zip(
+            model_params, main_params, raw_main_params, start_offsets
         ):
             _maybe_record_mxfp4_qat_fp8_copy_trace(
-                model_param, main_param, start_offset, copy_call_index
+                model_param, main_param, raw_main_param, start_offset, copy_call_index
             )
 
     def _correct_amax_history_if_needed_impl(model: List[torch.nn.Module]) -> None:
@@ -527,6 +648,7 @@ elif HAVE_TE and is_te_min_version("2.0"):
         ):
             if main_param is None:
                 continue
+            raw_main_param = main_param
 
             if fsdp_shard_model_param is not None:
                 shard_model_param = fsdp_shard_model_param
@@ -556,7 +678,7 @@ elif HAVE_TE and is_te_min_version("2.0"):
             )
             quantizer.update_quantized(main_param, out)
             _maybe_record_mxfp4_qat_fp8_copy_trace(
-                model_param, trace_main_param, start_offset, copy_call_index
+                model_param, trace_main_param, raw_main_param, start_offset, copy_call_index
             )
 
         amaxes = []
@@ -625,6 +747,7 @@ elif HAVE_TE and is_te_min_version("1.0"):
         ):
             if main_param is None:
                 continue
+            raw_main_param = main_param
 
             if fsdp_shard_model_param is not None:
                 shard_model_param = fsdp_shard_model_param
@@ -650,7 +773,7 @@ elif HAVE_TE and is_te_min_version("1.0"):
                 out=shard_model_param.view(1, -1),
             )
             _maybe_record_mxfp4_qat_fp8_copy_trace(
-                model_param, trace_main_param, start_offset, copy_call_index
+                model_param, trace_main_param, raw_main_param, start_offset, copy_call_index
             )
 
         amaxes = []
