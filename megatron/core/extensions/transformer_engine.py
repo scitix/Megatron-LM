@@ -1241,7 +1241,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
     # Bit-exact equivalence to the rollout-path quantization has been verified
     # on real DSV4-Flash expert weights against flashinfer.fp4_quantize +
     # flashinfer.mxfp4_dequantize_host (see
-    # tools/infra/mxfp4_ste_vs_flashinfer_probe_ckpt.py).
+    # tools/model_convert/dsv4_mxfp4_fake_qat_vs_flashinfer_probe.py).
     # ------------------------------------------------------------------
     _MXFP4_E2M1_POS_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
     _MXFP4_E2M1_MAX = 6.0
