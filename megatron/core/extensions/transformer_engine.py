@@ -1238,8 +1238,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
     # overridable via OPEN_TRAINING_MXFP4_BLOCK_SIZE for ablations. Mutually
     # exclusive with OPEN_TRAINING_INT4_FAKE_QAT_FLAG.
     #
-    # Bit-exact equivalence to the rollout-path quantization has been verified
-    # on real DSV4-Flash expert weights against flashinfer.fp4_quantize +
+    # Bit-exact equivalence to the rollout-path quantization is guarded by a
+    # small-card FlashInfer probe against flashinfer.fp4_quantize +
     # flashinfer.mxfp4_dequantize_host (see
     # tools/model_convert/dsv4_mxfp4_fake_qat_vs_flashinfer_probe.py).
     # ------------------------------------------------------------------
@@ -1272,8 +1272,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
     def _round_to_e2m1(x: torch.Tensor) -> torch.Tensor:
         """Round to E2M1 grid.
 
-        Keeps the bit-exact semantics of the miles reference (round-half-up via
-        bucketize with right=False) but minimizes peak memory:
+        Keeps the bit-exact FlashInfer semantics (round-to-nearest,
+        ties-to-even E2M1 code) while minimizing peak memory:
           - boundaries/grid tables cached at module level (no per-call alloc)
           - bucket index is int32 (torch.bucketize output is int64 by default
             but we pass out_int32=True)
@@ -1286,6 +1286,12 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
         mag = x.abs()
         # int32 bucket index, half the memory of the default int64.
         idx = torch.bucketize(mag, boundaries, right=False, out_int32=True)
+        # FlashInfer's E2M1 quantizer resolves exact midpoint ties to the
+        # even code index. bucketize(right=False) already selects the lower
+        # even code for boundaries 0, 2, 4, and 6; boundaries 1, 3, and 5
+        # need to advance to the upper even code.
+        tie_up = (mag == boundaries[1]) | (mag == boundaries[3]) | (mag == boundaries[5])
+        idx.add_(tie_up.to(idx.dtype))
         idx.clamp_(max=len(_MXFP4_E2M1_POS_GRID) - 1)
         grid_vals = grid[idx]  # same dtype as x
         del idx
