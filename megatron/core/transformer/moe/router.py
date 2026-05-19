@@ -201,7 +201,7 @@ class TopKRouter(Router):
             self.global_tokens_per_expert = None
             self.ga_steps = None
 
-        from sirl.utils.routing_replay import register_routing_replay
+        from megatron.core.transformer.moe.routing_replay import register_routing_replay
         register_routing_replay(self)
 
     def _maintain_float32_expert_bias(self):

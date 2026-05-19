@@ -26,8 +26,8 @@ class PackedSeqParams:
     local_cp_size: int = None
     cp_group: dist.ProcessGroup = None
     # Tree-attention metadata for the native tree-training path. ``None`` for
-    # all existing callers; populated by slime's TreeDataIterator when
-    # ``--enable-tree-training`` is on. TEDotProductAttention passes this
-    # through to TE, which dispatches to TreeFlashAttention.
+    # all existing callers; populated by downstream tree-data iterators when
+    # tree training is enabled. TEDotProductAttention passes this through to TE,
+    # which dispatches to TreeFlashAttention.
     # See megatron.core.transformer.tree_metadata.
     tree_metadata: Optional["TreeMetadata"] = None
