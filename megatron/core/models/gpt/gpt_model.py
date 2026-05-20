@@ -344,7 +344,9 @@ class GPTModel(LanguageModule):
                     inference_context, self.decoder, decoder_input, self.config, packed_seq_params
                 )
                 rotary_pos_emb = self.rotary_pos_emb(
-                    rotary_seq_len, packed_seq_params=packed_seq_params
+                    rotary_seq_len,
+                    packed_seq_params=packed_seq_params,
+                    position_ids=position_ids,
                 )
         elif self.position_embedding_type == 'yarn':
             if self.training or not self.config.flash_decode:

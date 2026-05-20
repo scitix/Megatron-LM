@@ -65,6 +65,10 @@ class AttnBackend(enum.Enum):
     unfused = 3
     local = 4
     auto = 5
+    # Tree-attention backend: data-driven dispatch via tree_metadata on
+    # PackedSeqParams. TEDotProductAttention detects tree_metadata and
+    # routes to TE's TreeFlashAttention backend. ``cp_size == 1`` required.
+    tree = 6
 
 
 class CudaGraphScope(enum.Enum):

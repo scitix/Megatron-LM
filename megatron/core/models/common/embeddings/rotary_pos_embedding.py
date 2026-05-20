@@ -177,7 +177,11 @@ class RotaryEmbedding(nn.Module):
 
     @internal_api
     def forward(
-        self, max_seq_len: int, offset: int = 0, packed_seq_params: Optional[PackedSeqParams] = None
+        self,
+        max_seq_len: int,
+        offset: int = 0,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        position_ids: Optional[Tensor] = None,
     ) -> Tensor:
         """Forward pass of RoPE embedding.
 
@@ -185,6 +189,10 @@ class RotaryEmbedding(nn.Module):
             max_seq_len (int): Maximum size of sequence
             offset (int, optional): RoPE offset. Defaults to 0.
             packed_seq_params (PackedSeqParams, optional): Packed sequence params. Defaults to None.
+            position_ids (Tensor, optional): Per-token positional ids for
+                reindexing the emb table. When provided, ``emb[position_ids]``
+                is returned so each packed token gets the RoPE frequency for
+                its logical position. Defaults to None (sequential positions).
 
         Returns:
             Tensor: Embeddings after applying RoPE.
@@ -201,6 +209,20 @@ class RotaryEmbedding(nn.Module):
             # slice rotary_pos_emb along sequence dimension
             # and select the parition of the current CP rank
             emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
+
+        if position_ids is not None:
+            pos_flat = position_ids.squeeze(0) if position_ids.dim() == 2 else position_ids
+            if pos_flat.device != emb.device:
+                pos_flat = pos_flat.to(emb.device)
+            if pos_flat.numel() > 0:
+                max_pos = int(pos_flat.max().item())
+                if max_pos >= emb.shape[0]:
+                    raise RuntimeError(
+                        f"RotaryEmbedding: position_id {max_pos} exceeds "
+                        f"emb table length {emb.shape[0]}; rotary_seq_len must "
+                        f"be >= max(position_ids) + 1."
+                    )
+            emb = emb[pos_flat]
 
         return emb
 
