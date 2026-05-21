@@ -436,6 +436,9 @@ def _replace_sharded_keys_with_state_dict_keys(
     """Inverse of _replace_state_dict_keys_with_sharded_keys."""
     recovered_sd = {}
     for k, tensors in state_dict.items():
+        if not isinstance(tensors, list):
+            # ShardedObject entries round-trip through PyTorch DCP as one BytesIO.
+            tensors = [tensors]
         assert len(tensors) == len(rename_mapping[k])
         for ten, recovered_k in zip(tensors, rename_mapping[k]):
             recovered_sd[recovered_k] = ten
