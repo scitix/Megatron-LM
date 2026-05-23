@@ -115,6 +115,35 @@ def _mxfp4_qat_headroom_grid_value() -> Optional[float]:
     return value
 
 
+def _mxfp4_qat_min_copy_call() -> Optional[int]:
+    raw_value = os.getenv("OPEN_TRAINING_MXFP4_FAKE_QAT_MIN_COPY_CALL", "")
+    if not raw_value:
+        return None
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(
+            "OPEN_TRAINING_MXFP4_FAKE_QAT_MIN_COPY_CALL must be a positive integer."
+        ) from exc
+    if value <= 0:
+        raise RuntimeError(
+            "OPEN_TRAINING_MXFP4_FAKE_QAT_MIN_COPY_CALL must be a positive integer."
+        )
+    return value
+
+
+def _mxfp4_qat_applies_to_copy_call(copy_call_index: Optional[int]) -> tuple[bool, Optional[int]]:
+    min_copy_call = _mxfp4_qat_min_copy_call()
+    if min_copy_call is None:
+        return True, None
+    if copy_call_index is None:
+        raise RuntimeError(
+            "OPEN_TRAINING_MXFP4_FAKE_QAT_MIN_COPY_CALL requires the "
+            "fp8_param_gather copy-call index."
+        )
+    return copy_call_index >= min_copy_call, min_copy_call
+
+
 def _maybe_apply_mxfp4_qat_main_param_headroom_(
     model_param: torch.Tensor,
     main_param: torch.Tensor,
@@ -169,6 +198,8 @@ def _maybe_fake_mxfp4_expert_qat_main_param_shard(
     model_param: torch.Tensor,
     main_param: Optional[torch.Tensor],
     start_offset: Optional[int],
+    *,
+    copy_call_index: Optional[int] = None,
 ) -> Optional[torch.Tensor]:
     if main_param is None:
         return None
@@ -202,6 +233,10 @@ def _maybe_fake_mxfp4_expert_qat_main_param_shard(
             f"aligned to group-{block_size} boundaries; got start_offset={start_offset}, "
             f"numel={main_param.numel()}."
         )
+
+    fake_qat_applied, _ = _mxfp4_qat_applies_to_copy_call(copy_call_index)
+    if not fake_qat_applied:
+        return main_param
 
     from megatron.core.extensions.transformer_engine import fake_mxfp4_quantization_ste
 
@@ -457,6 +492,7 @@ def _maybe_record_mxfp4_qat_fp8_copy_trace(
         return
 
     with torch.no_grad():
+        fake_qat_applied, min_copy_call = _mxfp4_qat_applies_to_copy_call(copy_call_index)
         expected = fake_main_param.detach().float().reshape(-1)
         raw = raw_main_param.detach().float().reshape(-1)
         if raw.numel() != expected.numel():
@@ -476,6 +512,8 @@ def _maybe_record_mxfp4_qat_fp8_copy_trace(
             "schema": "dsv4_mxfp4_qat_fp8_copy_trace.v1",
             "trace_index": record_index,
             "copy_call_index": copy_call_index,
+            "fake_qat_applied_to_fp8_copy": fake_qat_applied,
+            "fake_qat_min_copy_call": min_copy_call,
             "rank": _trace_rank(),
             "pid": os.getpid(),
             "param_name": getattr(model_param, "mcore_mxfp4_expert_qat_name", None),
@@ -667,7 +705,10 @@ if HAVE_TE and is_te_min_version("2.2"):
         raw_main_params = main_params
         main_params = [
             _maybe_fake_mxfp4_expert_qat_main_param_shard(
-                model_param, main_param, start_offset
+                model_param,
+                main_param,
+                start_offset,
+                copy_call_index=copy_call_index,
             )
             for model_param, main_param, start_offset in zip(
                 model_params, main_params, start_offsets
@@ -734,7 +775,10 @@ elif HAVE_TE and is_te_min_version("2.0"):
 
             quantizer = model_param._quantizer
             main_param = _maybe_fake_mxfp4_expert_qat_main_param_shard(
-                model_param, main_param, start_offset
+                model_param,
+                main_param,
+                start_offset,
+                copy_call_index=copy_call_index,
             )
             trace_main_param = main_param
             # When not using --fp8-param-gather, the main_param (fp32) is first cast to bf16/fp16,
@@ -836,7 +880,10 @@ elif HAVE_TE and is_te_min_version("1.0"):
             # Although it's not necessary when --fp8-param-gather is enabled, we still keep this
             # logic to keep numerical consistency. So here cast the main_param to model_param.dtype.
             main_param = _maybe_fake_mxfp4_expert_qat_main_param_shard(
-                model_param, main_param, start_offset
+                model_param,
+                main_param,
+                start_offset,
+                copy_call_index=copy_call_index,
             )
             trace_main_param = main_param
             main_param = main_param.to(model_param.dtype)
