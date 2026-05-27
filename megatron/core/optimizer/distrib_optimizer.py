@@ -53,6 +53,22 @@ from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
 from .optimizer_config import OptimizerConfig
 
+# SparseRL-Sync integration: init_sparse_manager binds the optimizer's shard
+# views to a SparseManager that tracks per-rollout dp-local diff indices.
+# sparse_diff_context wraps the in-place shard_model_param.copy_() that
+# realises the new training weights. Both fall back to no-ops when
+# sparse_update is not importable so the upstream behaviour is preserved.
+try:
+    from sparse_update import init_sparse_manager, sparse_diff_context
+except ImportError:
+    from contextlib import nullcontext
+
+    def sparse_diff_context(*args, **kwargs):
+        return nullcontext()
+
+    def init_sparse_manager(*args, **kwargs):
+        return None
+
 logger = getLogger(__name__)
 
 
@@ -413,6 +429,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     shard_float16_params_this_group.append(shard_model_param)
                     shard_fp32_from_float16_params_this_group.append(shard_main_param)
 
+                    # SparseRL-Sync: bind the shard views to a SparseManager so
+                    # later sparse_diff_context() calls can recover the owner.
+                    init_sparse_manager(
+                        model_param=model_param,
+                        shard_model_weight=shard_model_param,
+                        shard_main_weight=shard_main_param,
+                        param_range=param_range,
+                    )
+
                 # fp32 params.
                 elif model_param.type() == 'torch.cuda.FloatTensor':
                     shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
@@ -423,6 +448,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     )
                     if hasattr(model_param, 'shared'):
                         shard_model_param.shared = model_param.shared
+
+                    # SparseRL-Sync: fp32 params share the same shard view for
+                    # both "model" and "main" sides; pass it on both slots.
+                    init_sparse_manager(
+                        model_param=model_param,
+                        shard_model_weight=shard_model_param,
+                        shard_main_weight=shard_model_param,
+                        param_range=param_range,
+                    )
 
                 else:
                     raise TypeError(
@@ -2456,7 +2490,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # FP8 params are quantized in the above "quantize_param_shard" function.
                         continue
                     else:
-                        shard_model_param.data.copy_(shard_main_param)
+                        # SparseRL-Sync: capture the pre/post state of the
+                        # shard copy so the per-param diff indices can be
+                        # computed by the manager.
+                        with sparse_diff_context(shard_model_param, shard_main_param):
+                            shard_model_param.data.copy_(shard_main_param)
 
         # Copy shard groups to model groups.
         copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups)
