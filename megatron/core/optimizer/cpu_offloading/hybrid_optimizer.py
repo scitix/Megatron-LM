@@ -4,6 +4,18 @@ from typing import Dict
 
 import torch
 
+# SparseRL-Sync integration: sparse_diff_context wraps the param.copy_() so the
+# attached SparseManager can snapshot pre-state, then diff against post-state to
+# build per-param sparse-update indices. Falls back to nullcontext when the
+# sparse_update package is not installed so the upstream behavior is unchanged.
+try:
+    from sparse_update import sparse_diff_context
+except ImportError:
+    from contextlib import nullcontext
+
+    def sparse_diff_context(*args, **kwargs):
+        return nullcontext()
+
 
 def _param_generator(cpu_optimizer):
     for group in cpu_optimizer.param_groups:
@@ -121,7 +133,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 with torch.cuda.stream(self._h2d_stream):
                     for param in _param_generator(optimizer):
                         gpu_param = self.cpu_copys_map_gpu_param[param]
-                        gpu_param.data.copy_(param.data, non_blocking=True)
+                        with sparse_diff_context(gpu_param, param):
+                            gpu_param.data.copy_(param.data, non_blocking=True)
                 self._d2h_stream.record_event().wait(torch.cuda.current_stream())
 
             return param_copy_back_gpu_hook
@@ -137,7 +150,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
                         if param in self.param_to_fp32_param:
                             fp32_param = self.param_to_fp32_param[param]
-                            param.data.copy_(fp32_param.data)
+                            with sparse_diff_context(param, fp32_param):
+                                param.data.copy_(fp32_param.data)
 
             return fp32_param_copy_back_gpu_hook
 
