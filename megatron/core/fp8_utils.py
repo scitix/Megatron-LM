@@ -96,25 +96,6 @@ except ImportError:
     te_post_all_gather_processing = None
 
 
-def _mxfp4_qat_headroom_grid_value() -> Optional[float]:
-    raw_value = os.getenv("OPEN_TRAINING_MXFP4_FAKE_QAT_HEADROOM_GRID_VALUE", "")
-    if not raw_value:
-        return None
-    try:
-        value = float(raw_value)
-    except ValueError as exc:
-        raise RuntimeError(
-            "OPEN_TRAINING_MXFP4_FAKE_QAT_HEADROOM_GRID_VALUE must be a float "
-            "inside the E2M1 max-code bucket (5, 6)."
-        ) from exc
-    if not (5.0 < value < 6.0):
-        raise RuntimeError(
-            "OPEN_TRAINING_MXFP4_FAKE_QAT_HEADROOM_GRID_VALUE must be inside "
-            f"the E2M1 max-code bucket (5, 6); got {value}."
-        )
-    return value
-
-
 def _mxfp4_qat_min_copy_call() -> Optional[int]:
     raw_value = os.getenv("OPEN_TRAINING_MXFP4_FAKE_QAT_MIN_COPY_CALL", "")
     if not raw_value:
@@ -142,56 +123,6 @@ def _mxfp4_qat_applies_to_copy_call(copy_call_index: Optional[int]) -> tuple[boo
             "fp8_param_gather copy-call index."
         )
     return copy_call_index >= min_copy_call, min_copy_call
-
-
-def _maybe_apply_mxfp4_qat_main_param_headroom_(
-    model_param: torch.Tensor,
-    main_param: torch.Tensor,
-    *,
-    block_size: int,
-    start_offset: int,
-) -> None:
-    """Move raw QAT main params off the UE8M0 upper cliff without changing code.
-
-    DSV4 routed-expert FP4 checkpoints can initialize max-code values at
-    exactly ``6 * scale``. A tiny positive optimizer update to the block max
-    then selects the next UE8M0 scale exponent and remaps many E2M1 codes. This
-    optional projection runs once per optimizer shard and moves values inside
-    the max-code bucket, e.g. ``6 * scale -> 5.5 * scale``. Since the E2M1
-    code-7 bucket starts above 5, the fake/served initial value remains the
-    same while the optimizer main param gains scale headroom.
-    """
-    headroom_grid_value = _mxfp4_qat_headroom_grid_value()
-    if headroom_grid_value is None:
-        return
-
-    shard_key = (int(start_offset), int(main_param.numel()))
-    applied = getattr(model_param, "mcore_mxfp4_qat_headroom_applied_shards", None)
-    if applied is None:
-        applied = set()
-        setattr(model_param, "mcore_mxfp4_qat_headroom_applied_shards", applied)
-    if shard_key in applied:
-        return
-
-    with torch.no_grad():
-        main_view = main_param.view(-1, block_size)
-        float_view = main_view.float()
-        group_absmax = float_view.abs().amax(dim=1, keepdim=True)
-        exponent = (
-            group_absmax.div(_MXFP4_E2M1_POS_GRID[-1])
-            .clamp_(min=1e-8)
-            .log2_()
-            .ceil_()
-            .clamp_(min=-127.0, max=127.0)
-        )
-        scale = torch.pow(2.0, exponent).to(float_view.dtype)
-        target_abs = scale.mul(headroom_grid_value)
-        abs_view = float_view.abs()
-        needs_headroom = abs_view > target_abs
-        if bool(needs_headroom.any().item()):
-            target = torch.copysign(target_abs.expand_as(float_view), float_view)
-            main_view.copy_(torch.where(needs_headroom, target, float_view).to(main_view.dtype))
-    applied.add(shard_key)
 
 
 def _maybe_fake_mxfp4_expert_qat_main_param_shard(
@@ -240,12 +171,6 @@ def _maybe_fake_mxfp4_expert_qat_main_param_shard(
 
     from megatron.core.extensions.transformer_engine import fake_mxfp4_quantization_ste
 
-    _maybe_apply_mxfp4_qat_main_param_headroom_(
-        model_param,
-        main_param,
-        block_size=block_size,
-        start_offset=start_offset,
-    )
     fake_main_param = fake_mxfp4_quantization_ste(
         main_param.view(-1, block_size), block_size
     ).view_as(main_param)
