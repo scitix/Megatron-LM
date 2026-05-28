@@ -587,9 +587,6 @@ def topk_routing_with_score_function(
         else:
             return torch.topk(scores, k=topk, dim=1)
 
-    from megatron.core.transformer.moe.routing_replay import get_routing_replay_compute_topk
-    compute_topk = get_routing_replay_compute_topk(compute_topk)
-
     if score_function == "softmax":
         if use_pre_softmax:
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)

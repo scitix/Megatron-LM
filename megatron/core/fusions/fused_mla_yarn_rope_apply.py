@@ -435,7 +435,7 @@ def rotary_fwd_kv_kernel(
     cos_right = tl.load(COS + token_idx * emb_dim + emb_dim // 2 + tl.arange(0, emb_dim // 2))
     sin_right = tl.load(SIN + token_idx * emb_dim + emb_dim // 2 + tl.arange(0, emb_dim // 2))
 
-    KV_ptr = KV + pid_m * stride_kv_seq # + pid_head * BLOCK_H * stride_kv_nheads
+    KV_ptr = KV + pid_m * stride_kv_seq
     ki_range = tl.arange(0, BLOCK_H)[:, None] + pid_head * BLOCK_H
     kj_range = tl.arange(0, k_dim_ceil)[None, :]
     mask_k = (ki_range < head_num) & (kj_range < k_dim)
@@ -448,8 +448,8 @@ def rotary_fwd_kv_kernel(
         v = tl.zeros((BLOCK_H, 1), dtype=KV.dtype.element_ty)
     k = tl.load(KV_ptr + k_off, mask=mask_k)
 
-    K_ptr = O_KEY + pid_m * stride_k_seq # + pid_head * BLOCK_H * stride_k_nheads
-    V_ptr = O_VALUE + pid_m * stride_v_seq # + pid_head * BLOCK_H * stride_v_nheads
+    K_ptr = O_KEY + pid_m * stride_k_seq
+    V_ptr = O_VALUE + pid_m * stride_v_seq
 
     k_out_off = ki_range * stride_k_nheads + kj_range
     tl.store(K_ptr + k_out_off, k, mask=mask_k)
@@ -543,20 +543,20 @@ def rotary_bwd_kv_kernel(
     else:
         token_idx = _get_thd_token_idx(cu_seqlens_kv, pid_m, seq_num, cp_rank, cp_size)
 
-    dKV_ptr = dKV + pid_m * stride_dkv_seq # + pid_head * BLOCK_H * stride_dkv_nheads
-    ki_range = tl.arange(0, BLOCK_H)[:, None] + pid_head * BLOCK_H 
+    dKV_ptr = dKV + pid_m * stride_dkv_seq
+    ki_range = tl.arange(0, BLOCK_H)[:, None] + pid_head * BLOCK_H
     kj_range = tl.arange(0, k_dim_ceil)[None, :]
     mask_k = (ki_range < head_num) & (kj_range < k_dim)
     mask_v = ki_range < head_num
     dk_out_off = ki_range * stride_dkv_nheads + kj_range
 
-    dK_ptr = dK + pid_m * stride_dk_seq # + pid_head * BLOCK_H * stride_dk_nheads
-    dV_ptr = dV + pid_m * stride_dv_seq # + pid_head * BLOCK_H * stride_dv_nheads
+    dK_ptr = dK + pid_m * stride_dk_seq
+    dV_ptr = dV + pid_m * stride_dv_seq
     dk_in_off = ki_range * stride_dk_nheads + kj_range
 
     dk = tl.load(dK_ptr + dk_in_off, mask=mask_k)
     tl.store(dKV_ptr + dk_out_off, dk, mask=mask_k)
-    
+
     if v_dim > 0:
         dv_out_off = ki_range * stride_dkv_nheads + k_dim + tl.arange(0, v_dim)[None, :]
         dv_in_off = ki_range * stride_dv_nheads + tl.arange(0, v_dim)[None, :]
@@ -567,7 +567,7 @@ def rotary_bwd_kv_kernel(
         x_left_accum = tl.zeros((BLOCK_H, emb_dim // 2), dtype=tl.float32)
         x_right_accum = tl.zeros((BLOCK_H, emb_dim // 2), dtype=tl.float32)
         for i in tl.static_range(triton.cdiv(head_num, BLOCK_H)):
-            dK_ptr = dK + pid_m * stride_dk_seq # + i * BLOCK_H * stride_dk_nheads
+            dK_ptr = dK + pid_m * stride_dk_seq
             x_off = tl.arange(0, BLOCK_H)[:, None] * stride_dk_nheads + k_dim + i * BLOCK_H * stride_dk_nheads
             mask = x_off < head_num * stride_dk_nheads
             x_left_off = x_off + tl.arange(0, emb_dim // 2)[None, :]

@@ -11,7 +11,6 @@ from typing import Callable, List, Optional
 
 import numpy as np
 import torch
-import torch.distributed as dist
 
 from .utils import GlobalMemoryBuffer, is_torch_min_version
 

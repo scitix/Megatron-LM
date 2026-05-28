@@ -836,7 +836,6 @@ class MultiTokenPredictionLayer(MegatronModule):
         issues with non-tensor inputs.
         """
 
-        # TODO(jiajun): Is there any better implementation here?
         positional_specs = []
         kw_specs = []
         tensor_args: List[torch.Tensor] = []
