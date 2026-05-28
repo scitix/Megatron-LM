@@ -1619,11 +1619,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     fake_int4_quantization_ste(w, group_size)
                     for w in weight_tensors
                 ]
-            elif mxfp4_enabled and not self.config.fp8_param:
-                # With fp8_param_gather, the high-precision main param is
-                # fake-quantized before casting into the TE FP8 compute param.
-                # Reapplying fake MXFP4 here would quantize the already-FP8
-                # forward tensor and would not represent the rollout format.
+            elif mxfp4_enabled:
+                # Standard QAT semantics: fake-MXFP4 is part of the routed
+                # expert forward graph. With fp8_param_gather this acts on the
+                # TE FP8 forward weight tensor after the normal main-param ->
+                # model-param copy, rather than changing the copy boundary.
                 # MXFP4 spec fixes block size at 32; env is overridable for ablations.
                 block_size = int(os.getenv("OPEN_TRAINING_MXFP4_BLOCK_SIZE", "32"))
                 weight_tensors = [

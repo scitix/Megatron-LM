@@ -113,7 +113,15 @@ def _mxfp4_qat_min_copy_call() -> Optional[int]:
     return value
 
 
+def _mxfp4_qat_copy_boundary_enabled() -> bool:
+    """Return whether the old fake-MXFP4 -> TE-FP8 copy-boundary probe is enabled."""
+    return os.getenv("OPEN_TRAINING_MXFP4_FAKE_QAT_COPY_BOUNDARY", "0") == "1"
+
+
 def _mxfp4_qat_applies_to_copy_call(copy_call_index: Optional[int]) -> tuple[bool, Optional[int]]:
+    if not _mxfp4_qat_copy_boundary_enabled():
+        return False, _mxfp4_qat_min_copy_call()
+
     min_copy_call = _mxfp4_qat_min_copy_call()
     if min_copy_call is None:
         return True, None
@@ -137,6 +145,10 @@ def _maybe_fake_mxfp4_expert_qat_main_param_shard(
     if os.getenv("OPEN_TRAINING_MXFP4_FAKE_QAT_FLAG", "0") != "1":
         return main_param
     if not getattr(model_param, "mcore_mxfp4_expert_qat_weight", False):
+        return main_param
+
+    fake_qat_applied, _ = _mxfp4_qat_applies_to_copy_call(copy_call_index)
+    if not fake_qat_applied:
         return main_param
 
     block_size = int(os.getenv("OPEN_TRAINING_MXFP4_BLOCK_SIZE", "32"))
@@ -164,10 +176,6 @@ def _maybe_fake_mxfp4_expert_qat_main_param_shard(
             f"aligned to group-{block_size} boundaries; got start_offset={start_offset}, "
             f"numel={main_param.numel()}."
         )
-
-    fake_qat_applied, _ = _mxfp4_qat_applies_to_copy_call(copy_call_index)
-    if not fake_qat_applied:
-        return main_param
 
     from megatron.core.extensions.transformer_engine import fake_mxfp4_quantization_ste
 
@@ -395,12 +403,13 @@ def _maybe_record_mxfp4_qat_fp8_copy_trace(
     start_offset: Optional[int],
     copy_call_index: int,
 ) -> None:
-    """Trace fake-MXFP4 main-param -> TE FP8 compute-param loss.
+    """Trace main-param -> TE FP8 compute-param copy loss.
 
     This is disabled by default. It is intentionally train-side: rollout export
-    tracing proves TE-FP8-export -> native-FP4 pack/dequant, while this hook
-    measures the earlier copy boundary where QAT feeds fake FP4 weights into TE
-    blockwise FP8 compute params.
+    tracing proves TE-FP8-export -> native-FP4 pack/dequant. Standard QAT keeps
+    fake-MXFP4 in the TEGroupedLinear forward graph; this hook only applies
+    fake-MXFP4 at the copy boundary when
+    OPEN_TRAINING_MXFP4_FAKE_QAT_COPY_BOUNDARY=1 for old diagnostics.
     """
     path_template = os.getenv("SIRL_DSV4_QAT_FP8_COPY_TRACE_PATH", "")
     if not path_template or not _should_record_mxfp4_qat_fp8_copy_trace(copy_call_index):
@@ -437,6 +446,7 @@ def _maybe_record_mxfp4_qat_fp8_copy_trace(
             "schema": "dsv4_mxfp4_qat_fp8_copy_trace.v1",
             "trace_index": record_index,
             "copy_call_index": copy_call_index,
+            "fake_qat_copy_boundary_enabled": _mxfp4_qat_copy_boundary_enabled(),
             "fake_qat_applied_to_fp8_copy": fake_qat_applied,
             "fake_qat_min_copy_call": min_copy_call,
             "rank": _trace_rank(),
