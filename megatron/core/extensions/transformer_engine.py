@@ -62,6 +62,25 @@ except ImportError:
     te = MagicMock()
     HAVE_TE = False
 
+_TE_QUANTIZED_TENSOR_TYPES = ()
+if HAVE_TE:
+    try:
+        from transformer_engine.pytorch.tensor import QuantizedTensor as _TEQuantizedTensor
+
+        _TE_QUANTIZED_TENSOR_TYPES = _TE_QUANTIZED_TENSOR_TYPES + (_TEQuantizedTensor,)
+    except (ImportError, ModuleNotFoundError, AttributeError):
+        pass
+    try:
+        from transformer_engine.pytorch.quantized_tensor import (
+            QuantizedTensorStorage as _TEQuantizedTensorStorage,
+        )
+
+        _TE_QUANTIZED_TENSOR_TYPES = _TE_QUANTIZED_TENSOR_TYPES + (
+            _TEQuantizedTensorStorage,
+        )
+    except (ImportError, ModuleNotFoundError, AttributeError):
+        pass
+
 
 def _get_extra_te_kwargs(config: TransformerConfig):
     extra_transformer_engine_kwargs = {"params_dtype": config.params_dtype}
@@ -1385,6 +1404,23 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             return grad_output, None
 
     def fake_mxfp4_quantization_ste(x, block_size=_MXFP4_BLOCK_SIZE):
+        if _TE_QUANTIZED_TENSOR_TYPES and isinstance(x, _TE_QUANTIZED_TENSOR_TYPES):
+            original_weight = x
+            x = x.dequantize()
+            if original_weight.requires_grad and not x.requires_grad:
+                x = x.detach().requires_grad_(True)
+            # TE's grouped-linear backward writes fused wgrad through these
+            # attributes. Dequantizing primary-FP8 params for forward QAT must
+            # not detach the fake-QAT tensor from the existing main-grad path.
+            for attr in (
+                "main_grad",
+                "grad_added_to_main_grad",
+                "zero_out_wgrad",
+                "overwrite_main_grad",
+            ):
+                if hasattr(original_weight, attr):
+                    setattr(x, attr, getattr(original_weight, attr))
+
         x_out = _FakeMXFP4QuantizationSTE.apply(x, block_size)
 
         # Preserve Megatron DDP's ``main_grad`` accumulator: the outer
