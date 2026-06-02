@@ -35,6 +35,30 @@ class RoutingReplay:
         buf.copy_(top_indices)
         self.top_indices_list.append(buf)
 
+    def record_prepared(self, top_indices):
+        """Record a CPU replay tensor that was already packed by the caller."""
+        self.top_indices_list.append(top_indices)
+
+    @staticmethod
+    def record_all_prepared(layer_major_top_indices):
+        """Record a prepared `[layers, tokens, topk]` replay buffer as per-layer views."""
+        if layer_major_top_indices.ndim != 3:
+            raise ValueError(
+                "Prepared routing replay buffer must be rank-3 "
+                f"[layers, tokens, topk], got shape={tuple(layer_major_top_indices.shape)}"
+            )
+        if layer_major_top_indices.shape[0] != len(RoutingReplay.all_routing_replays):
+            raise ValueError(
+                "Prepared routing replay layer count must match registered replays: "
+                f"layers={layer_major_top_indices.shape[0]} registered={len(RoutingReplay.all_routing_replays)}"
+            )
+        for replay, top_indices in zip(
+            RoutingReplay.all_routing_replays,
+            layer_major_top_indices.unbind(dim=0),
+            strict=True,
+        ):
+            replay.record_prepared(top_indices)
+
     def pop_forward(self):
         if self.forward_index >= len(self.top_indices_list):
             raise RuntimeError(
@@ -43,7 +67,7 @@ class RoutingReplay:
             )
         top_indices = self.top_indices_list[self.forward_index]
         self.forward_index += 1
-        return top_indices.to(torch.cuda.current_device())
+        return top_indices.to(torch.cuda.current_device(), non_blocking=True)
 
     def pop_backward(self):
         if self.backward_index >= len(self.top_indices_list):
@@ -53,7 +77,7 @@ class RoutingReplay:
             )
         top_indices = self.top_indices_list[self.backward_index]
         self.backward_index += 1
-        return top_indices.to(torch.cuda.current_device())
+        return top_indices.to(torch.cuda.current_device(), non_blocking=True)
 
     def clear(self):
         self.forward_index = 0
