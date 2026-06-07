@@ -204,12 +204,13 @@ def is_mxfp8tensor(tensor: torch.Tensor) -> bool:
     return HAVE_TE_MXFP8TENSOR and isinstance(tensor, MXFP8Tensor)
 
 
-def dequantize_fp8_tensor(fp8_tensor: torch.Tensor) -> torch.Tensor:
+def dequantize_fp8_tensor(fp8_tensor: torch.Tensor, *, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
     """Dequantize a fp8 tensor to a higher precision tensor."""
     if is_te_min_version("2.0"):
-        return fp8_tensor.dequantize()
-    else:
-        return fp8_tensor.from_float8()
+        return fp8_tensor.dequantize(dtype=dtype) if dtype is not None else fp8_tensor.dequantize()
+
+    tensor = fp8_tensor.from_float8()
+    return tensor.to(dtype=dtype) if dtype is not None else tensor
 
 
 _MXFP4_QAT_FP8_COPY_TRACE_REMAINING = None

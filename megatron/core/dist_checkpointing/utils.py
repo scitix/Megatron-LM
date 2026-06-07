@@ -2,9 +2,12 @@
 
 """ Helpers for manipulating sharded tensors and sharded state dicts. """
 import logging
+import os
 from contextlib import contextmanager
 from time import time
 from typing import Dict, Optional, Tuple
+
+import torch
 
 from .dict_utils import dict_list_map_inplace, extract_matching_values, nested_values
 from .mapping import (
@@ -233,6 +236,27 @@ def apply_prefix_mapping(sharded_state_dict: ShardedStateDict, prefix_map: Dict[
     dict_list_map_inplace(_replace_prefixes, sharded_state_dict)
 
 
+def _dist_ckpt_fp8_dequant_dtype() -> Optional[torch.dtype]:
+    value = os.getenv("MEGATRON_DIST_CKPT_FP8_DEQUANT_DTYPE", "").strip().lower()
+    if value in ("", "default", "none"):
+        return None
+    dtype_by_name = {
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "fp16": torch.float16,
+        "float16": torch.float16,
+        "half": torch.float16,
+        "fp32": torch.float32,
+        "float32": torch.float32,
+    }
+    if value not in dtype_by_name:
+        raise ValueError(
+            "MEGATRON_DIST_CKPT_FP8_DEQUANT_DTYPE must be one of "
+            f"{sorted(dtype_by_name)} plus default/none, got {value!r}"
+        )
+    return dtype_by_name[value]
+
+
 def force_all_tensors_to_non_fp8(sharded_state_dict: ShardedStateDict):
     """Force all tensors in state dict to be non-fp8.
 
@@ -241,9 +265,11 @@ def force_all_tensors_to_non_fp8(sharded_state_dict: ShardedStateDict):
     """
     from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor  # Avoid circular import
 
+    dequant_dtype = _dist_ckpt_fp8_dequant_dtype()
+
     for v in nested_values(sharded_state_dict):
         if hasattr(v, "data") and is_float8tensor(v.data):
-            v.data = dequantize_fp8_tensor(v.data)
+            v.data = dequantize_fp8_tensor(v.data, dtype=dequant_dtype)
 
 
 fallback_logger = logging.getLogger(__name__)
