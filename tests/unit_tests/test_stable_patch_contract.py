@@ -4,7 +4,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedTensor
 from megatron.core.dist_checkpointing.strategies.torch import MCoreLoadPlanner
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.pipeline_parallel.p2p_communication import _batched_p2p_ops
 from megatron.core.transformer.moe.moe_layer import MoESubmodules
 from megatron.core.transformer.moe.router import TopKRouter
@@ -90,6 +92,48 @@ def test_moe_submodules_exposes_generic_router_extension_point():
     submodules = MoESubmodules(router=ModuleSpec(module=CustomRouter))
 
     assert submodules.router.module is CustomRouter
+
+
+def test_dp_reshardable_optimizer_state_keeps_step_local():
+    class _Group:
+        def rank(self):
+            return 0
+
+        def size(self):
+            return 1
+
+    class _Bucket:
+        numel_unpadded = 4
+        grad_data = torch.zeros(4)
+
+    optimizer = DistributedOptimizer.__new__(DistributedOptimizer)
+    optimizer.data_parallel_group = _Group()
+    optimizer.data_parallel_group_idx = 0
+    optimizer.distributed_optimizer_instance_id = 0
+    optimizer.gbuf_ranges = [None]
+    optimizer.buffers = [SimpleNamespace(buckets=[_Bucket()])]
+    bucket_state = [
+        {
+            "gbuf_local_start": 0,
+            "gbuf_local_end": 4,
+            "exp_avg": torch.zeros(4),
+            "step": torch.tensor(3.0),
+        }
+    ]
+    optimizer.get_parameter_state_dp_reshardable = lambda: {
+        "per_bucket_numel": [4],
+        "per_bucket_numel_unpadded": [4],
+        0: {torch.float32: [bucket_state]},
+    }
+
+    state = DistributedOptimizer.sharded_param_state_dp_reshardable(
+        optimizer, model_sharded_state_dict={}
+    )
+
+    tensor_state = state[0][torch.float32][0][0]
+    assert isinstance(tensor_state["exp_avg"], ShardedTensor)
+    assert isinstance(tensor_state["step"], LocalNonpersistentObject)
+    assert tensor_state["step"].obj.shape == torch.Size([])
 
 
 def test_megatron_stable_has_no_trainer_owned_routing_replay_module():
