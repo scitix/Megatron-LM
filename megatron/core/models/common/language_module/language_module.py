@@ -133,7 +133,7 @@ class LanguageModule(MegatronModule):
         weight: Tensor = None,
         sequence_parallel_enabled: bool = False,
         column_parallel_linear: torch.nn.Module = None,
-        col_linear_kwargs: Dict[str, Any] = {},
+        col_linear_kwargs: Optional[Dict[str, Any]] = None,
         reduction: Literal["none", "sum", "mean"] = "none",
         ignore_index: int = -100,
     ) -> Tensor:
@@ -155,6 +155,7 @@ class LanguageModule(MegatronModule):
         Returns:
             Tensor: Loss tensor of dimensions [batch size, sequence_length].
         """
+        col_linear_kwargs = col_linear_kwargs or {}
         if (
             self.config.cross_entropy_loss_fusion
             and self.config.cross_entropy_fusion_impl == 'linear'
@@ -184,15 +185,7 @@ class LanguageModule(MegatronModule):
             assert (
                 column_parallel_linear is not None
             ), "column_parallel_linear cannot be None when not using fused linear cross entropy."
-            # output
-            output_layer_params = {k: v.detach() for k, v in column_parallel_linear.named_parameters()}
-            output_layer_buffers = dict(column_parallel_linear.named_buffers())
-            logits, _ = torch.func.functional_call(
-                column_parallel_linear,
-                {**output_layer_params, **output_layer_buffers},
-                (hidden,),
-                col_linear_kwargs,
-            )
+            logits, _ = column_parallel_linear(hidden, **col_linear_kwargs)
 
             return self.compute_language_model_loss(labels, logits)
 

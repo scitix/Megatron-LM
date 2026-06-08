@@ -1771,8 +1771,6 @@ def _add_network_size_args(parser):
                        help='If set, use post self attention layernorm.')
     group.add_argument('--post-mlp-layernorm', action='store_true',
                        help='If set, use post MLP layernorm.')
-    group.add_argument('--use-gated-attention', action='store_true',
-                       help='If set, use gated attention as in Qwen3Next')
     group.add_argument('--openai-gelu', action='store_true',
                        help='Use OpenAIs GeLU implementation. This option'
                        'should not be used unless for backward compatibility'

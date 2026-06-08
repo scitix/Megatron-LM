@@ -41,6 +41,7 @@ class MoESubmodules:
 
     experts: Union[ModuleSpec, type] = None
     shared_experts: Union[ModuleSpec, type] = None
+    router: Union[ModuleSpec, type] = TopKRouter
 
 
 class BaseMoELayer(MegatronModule, ABC):
@@ -126,7 +127,10 @@ class MoELayer(BaseMoELayer):
         )
 
         # Initialize router
-        self.router = TopKRouter(config=self.config, pg_collection=pg_collection)
+        router = TopKRouter
+        if self.submodules is not None and self.submodules.router is not None:
+            router = self.submodules.router
+        self.router = build_module(router, config=self.config, pg_collection=pg_collection)
         self.tp_group = pg_collection.tp
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":
