@@ -69,6 +69,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_biencoder_args(parser)
     parser = _add_vision_args(parser)
     parser = _add_moe_args(parser)
+    parser = _add_sonic_moe_args(parser)
     parser = _add_mla_args(parser)
     parser = _add_experimental_attention_variant_args(parser)
     parser = _add_heterogeneous_args(parser)
@@ -1091,6 +1092,53 @@ def validate_args(args, defaults={}):
         args.moe_router_load_balancing_type = args.moe_router_load_balancing_type[0]
     if isinstance(args.moe_aux_loss_coeff, list) and len(args.moe_aux_loss_coeff) == 1:
         args.moe_aux_loss_coeff = args.moe_aux_loss_coeff[0]
+
+    if args.use_sonic_moe:
+        assert args.num_experts is not None, "--use-sonic-moe requires --num-experts."
+        assert not args.use_legacy_models, "--use-sonic-moe is only supported for mcore models."
+        assert (
+            args.tensor_model_parallel_size == 1
+        ), "--use-sonic-moe does not support tensor model parallelism yet."
+        assert (
+            args.expert_model_parallel_size == 1
+        ), "--use-sonic-moe does not support expert model parallelism yet."
+        assert (
+            args.expert_tensor_parallel_size == 1
+        ), "--use-sonic-moe does not support expert tensor parallelism yet."
+        assert not getattr(args, "overlap_moe_expert_parallel_comm", False), (
+            "--use-sonic-moe does not support --overlap-moe-expert-parallel-comm."
+        )
+        assert getattr(args, "moe_shared_expert_intermediate_size", None) is None, (
+            "--use-sonic-moe does not support shared experts."
+        )
+        assert getattr(args, "moe_latent_size", None) is None, (
+            "--use-sonic-moe does not support MoE latent projections."
+        )
+        assert getattr(args, "moe_expert_capacity_factor", None) is None, (
+            "--use-sonic-moe does not support token dropping or expert capacity."
+        )
+        assert not getattr(args, "moe_router_padding_for_quantization", False), (
+            "--use-sonic-moe does not support router padding for quantization."
+        )
+        assert getattr(args, "moe_router_score_function", "softmax") in (
+            "softmax",
+            "sigmoid",
+        ), "--use-sonic-moe only supports softmax or sigmoid routing."
+        assert getattr(args, "moe_router_num_groups", None) is None, (
+            "--use-sonic-moe does not support group-limited routing."
+        )
+        assert getattr(args, "moe_router_group_topk", None) is None, (
+            "--use-sonic-moe does not support group-limited routing."
+        )
+        assert not getattr(args, "moe_router_enable_expert_bias", False), (
+            "--use-sonic-moe does not support expert-bias routing."
+        )
+        assert getattr(args, "moe_input_jitter_eps", None) is None, (
+            "--use-sonic-moe does not support router input jitter."
+        )
+        assert getattr(args, "fp8", None) is None and not getattr(args, "fp4", False), (
+            "--use-sonic-moe does not support fp8/fp4 expert compute."
+        )
 
     # Distributed checkpointing checks
     if args.use_dist_ckpt and args.use_legacy_models:
@@ -3319,6 +3367,14 @@ def _add_moe_args(parser):
                        help="some MoE routers have a D2H sync that will break cuda graphs.  If this flag is set the router will switch" \
                        " to dropping and padding during decode time which does not have a D2H sync. The capacity factor is set to the" \
                        " max that an expert could see during inference so no tokens are actually dropped.")
+    return parser
+
+def _add_sonic_moe_args(parser):
+    group = parser.add_argument_group(title="sonic moe")
+    group.add_argument('--use-sonic-moe', action='store_true', default=False,
+                       help='Replace mcore MoE MLP specs with SonicMoELayer. '
+                            'This requires --num-experts and currently supports only TP=EP=ETP=1; '
+                            'checkpoint load/save remains in the standard Megatron MoE format.')
     return parser
 
 def _add_mla_args(parser):
