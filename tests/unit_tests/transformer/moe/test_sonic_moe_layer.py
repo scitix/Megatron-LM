@@ -1,11 +1,16 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import dataclasses
+import os
+import shutil
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
+from megatron.core import dist_checkpointing
+from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
@@ -14,6 +19,7 @@ from megatron.core.transformer.moe.moe_utils import (
     clear_aux_losses_tracker,
     get_default_pg_collection,
     get_moe_layer_wise_logging_tracker,
+    router_gating_linear,
 )
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.router import TopKRouter
@@ -21,6 +27,7 @@ from megatron.core.transformer.moe.sonic_moe_layer import (
     SonicMoELayer,
     replace_moe_layer_specs_with_sonic_moe,
 )
+from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
@@ -37,10 +44,79 @@ ROUTER_KERNEL_RTOL = 1.0e-4
 ROUTER_KERNEL_ATOL = 3.0e-5
 FORWARD_RTOL = 1.0e-2
 FORWARD_ATOL = 1.0e-5
+EP2_DCP_PREFIX = "decoder.layers.0.mlp."
 
 
 def _require_sonicmoe():
     pytest.importorskip("sonicmoe")
+
+
+def _ep2_dcp_expected_tensors(config, device):
+    router = (
+        torch.arange(
+            config.num_moe_experts * config.hidden_size,
+            dtype=torch.float32,
+            device=device,
+        ).view(config.num_moe_experts, config.hidden_size)
+        / 100.0
+    )
+    fc1 = torch.arange(
+        config.num_moe_experts * 2 * config.moe_ffn_hidden_size * config.hidden_size,
+        dtype=torch.float32,
+        device=device,
+    ).view(config.num_moe_experts, 2 * config.moe_ffn_hidden_size, config.hidden_size)
+    fc2 = torch.arange(
+        config.num_moe_experts * config.hidden_size * config.moe_ffn_hidden_size,
+        dtype=torch.float32,
+        device=device,
+    ).view(config.num_moe_experts, config.hidden_size, config.moe_ffn_hidden_size)
+    return router, fc1.to(dtype=config.params_dtype), fc2.to(dtype=config.params_dtype)
+
+
+def _ep2_dcp_sharded_state(config, rank, world_size, device, with_data):
+    router, fc1, fc2 = _ep2_dcp_expected_tensors(config, device)
+    if not with_data:
+        router = torch.empty_like(router)
+        fc1 = torch.empty_like(fc1)
+        fc2 = torch.empty_like(fc2)
+
+    local_experts = config.num_moe_experts // world_size
+    start = rank * local_experts
+    end = start + local_experts
+    fc1_gate, fc1_up = torch.chunk(fc1[start:end], 2, dim=1)
+
+    return {
+        f"{EP2_DCP_PREFIX}router.weight": ShardedTensor.from_rank_offsets(
+            f"{EP2_DCP_PREFIX}router.weight",
+            router,
+            replica_id=(0, 0, rank),
+        ),
+        f"{EP2_DCP_PREFIX}experts.experts.linear_fc1.weight.gate": (
+            ShardedTensor.from_rank_offsets(
+                f"{EP2_DCP_PREFIX}experts.experts.linear_fc1.weight",
+                fc1_gate.contiguous(),
+                (0, rank, world_size),
+                (1, 0, 2),
+                replica_id=(0, 0, 0),
+            )
+        ),
+        f"{EP2_DCP_PREFIX}experts.experts.linear_fc1.weight.up": (
+            ShardedTensor.from_rank_offsets(
+                f"{EP2_DCP_PREFIX}experts.experts.linear_fc1.weight",
+                fc1_up.contiguous(),
+                (0, rank, world_size),
+                (1, 1, 2),
+                replica_id=(0, 0, 0),
+            )
+        ),
+        f"{EP2_DCP_PREFIX}experts.experts.linear_fc2.weight": ShardedTensor.from_rank_offsets(
+            f"{EP2_DCP_PREFIX}experts.experts.linear_fc2.weight",
+            fc2[start:end].contiguous(),
+            (0, rank, world_size),
+            (2, 0, 1),
+            replica_id=(0, 0, 0),
+        ),
+    }
 
 
 class TestSonicMoELayerRouterLoss:
@@ -139,6 +215,11 @@ class TestSonicMoELayerRouterLoss:
             assert layer.sonic_moe.c_fc.bias.dtype is torch.bfloat16
         if layer.sonic_moe.c_proj.bias is not None:
             assert layer.sonic_moe.c_proj.bias.dtype is torch.bfloat16
+
+        wrapped_layer = Float16Module(self.default_config, self._new_sonic_layer(self.default_config))
+        assert wrapped_layer.module.sonic_moe.router.weight.dtype is torch.float32
+        assert wrapped_layer.module.sonic_moe.c_fc.weight.dtype is torch.bfloat16
+        assert wrapped_layer.module.sonic_moe.c_proj.weight.dtype is torch.bfloat16
 
         ddp = DistributedDataParallel(
             self.default_config,
@@ -529,6 +610,113 @@ class TestSonicMoELayerRouterLoss:
                 roundtrip_state[key], tensor, rtol=EXACT_RTOL, atol=EXACT_ATOL
             )
 
+    def test_load_ep2_distributed_checkpoint(self, tmp_path):
+        if Utils.world_size != 2:
+            pytest.skip("Run with torchrun --nproc_per_node=2 to exercise EP=2 DCP.")
+        if torch.cuda.device_count() < 2:
+            pytest.skip("EP=2 checkpoint test requires at least 2 CUDA devices.")
+
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=8,
+            num_attention_heads=1,
+            ffn_hidden_size=16,
+            num_moe_experts=4,
+            moe_ffn_hidden_size=4,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="none",
+            moe_aux_loss_coeff=0.0,
+            moe_z_loss_coeff=None,
+            moe_router_score_function="sigmoid",
+            moe_router_dtype="fp32",
+            add_bias_linear=False,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        rank = Utils.rank
+        world_size = Utils.world_size
+        device = torch.device("cuda", torch.cuda.current_device())
+        shared_tmp_path = [str(tmp_path) if rank == 0 else None]
+        dist.broadcast_object_list(shared_tmp_path, src=0)
+        src_ckpt_dir = os.path.join(shared_tmp_path[0], "source_ep2_dcp")
+        sonic_ckpt_dir = os.path.join(shared_tmp_path[0], "sonic_saved_dcp")
+
+        if rank == 0:
+            for ckpt_dir in (src_ckpt_dir, sonic_ckpt_dir):
+                if os.path.exists(ckpt_dir):
+                    shutil.rmtree(ckpt_dir)
+                os.makedirs(ckpt_dir, exist_ok=True)
+        dist.barrier()
+
+        src_ep2_state = _ep2_dcp_sharded_state(
+            config, rank, world_size, device, with_data=True
+        )
+        dist_checkpointing.save(
+            src_ep2_state, src_ckpt_dir, validate_access_integrity=False
+        )
+        dist.barrier()
+
+        layer = SonicMoELayer(config=config, pg_collection=get_default_pg_collection()).cuda()
+        layer.set_layer_number(0)
+        loaded = dist_checkpointing.load(
+            layer.sharded_state_dict(prefix=EP2_DCP_PREFIX),
+            src_ckpt_dir,
+            validate_access_integrity=False,
+            strict="raise_all",
+        )
+        load_result = layer.load_state_dict(
+            {
+                key.removeprefix(EP2_DCP_PREFIX): value
+                for key, value in loaded.items()
+                if key.startswith(EP2_DCP_PREFIX)
+            },
+            strict=True,
+        )
+        assert load_result.missing_keys == []
+        assert load_result.unexpected_keys == []
+
+        router, fc1, fc2 = _ep2_dcp_expected_tensors(
+            config, torch.device("cuda", torch.cuda.current_device())
+        )
+        torch.testing.assert_close(
+            layer.sonic_moe.router.weight, router, rtol=EXACT_RTOL, atol=EXACT_ATOL
+        )
+        torch.testing.assert_close(
+            layer.sonic_moe.c_fc.weight, fc1, rtol=EXACT_RTOL, atol=EXACT_ATOL
+        )
+        torch.testing.assert_close(
+            layer.sonic_moe.c_proj.weight, fc2, rtol=EXACT_RTOL, atol=EXACT_ATOL
+        )
+        assert layer.sonic_moe.router.weight.dtype is torch.float32
+
+        dist_checkpointing.save(
+            layer.sharded_state_dict(prefix=EP2_DCP_PREFIX),
+            sonic_ckpt_dir,
+            validate_access_integrity=False,
+        )
+        dist.barrier()
+
+        src_ep2_loaded = dist_checkpointing.load(
+            _ep2_dcp_sharded_state(config, rank, world_size, device, with_data=False),
+            src_ckpt_dir,
+            validate_access_integrity=False,
+            strict="raise_all",
+        )
+        sonic_ep2_loaded = dist_checkpointing.load(
+            _ep2_dcp_sharded_state(config, rank, world_size, device, with_data=False),
+            sonic_ckpt_dir,
+            validate_access_integrity=False,
+            strict="raise_all",
+        )
+        assert set(src_ep2_loaded.keys()) == set(sonic_ep2_loaded.keys())
+        for key, tensor in src_ep2_loaded.items():
+            torch.testing.assert_close(
+                sonic_ep2_loaded[key], tensor, rtol=EXACT_RTOL, atol=EXACT_ATOL
+            )
+
     @staticmethod
     def _origin_grouped_moe_state_dict(config, expert_weight_scale: float = 1.0):
         weight1_shape = (
@@ -627,8 +815,14 @@ class TestSonicMoELayerRouterLoss:
         sonic_layer.sonic_moe.router.weight.grad = None
         hidden_state = hidden_state.detach().clone().requires_grad_(True)
 
-        router_logits = F.linear(hidden_state.float(), sonic_layer.sonic_moe.router.weight).view(
-            -1, sonic_layer.config.num_moe_experts
+        router_logits = router_gating_linear(
+            hidden_state,
+            sonic_layer.sonic_moe.router.weight,
+            sonic_layer.sonic_moe.router.bias,
+            sonic_layer._router_dtype(hidden_state),
+        ).view(
+            -1,
+            sonic_layer.config.num_moe_experts,
         )
         tokens_per_expert = self._tokens_per_expert(router_logits, sonic_layer.config)
         output = torch.zeros_like(hidden_state, requires_grad=True)

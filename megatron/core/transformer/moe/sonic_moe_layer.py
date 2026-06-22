@@ -14,12 +14,16 @@ from typing import Optional, Union
 import torch
 import torch.nn.functional as F
 
+from megatron.core.dist_checkpointing import ShardedTensor
+from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.utils import get_pg_rank, get_pg_size, make_sharded_tensor_for_checkpoint
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer, MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
     compute_routing_scores_for_aux_loss,
     get_default_pg_collection,
+    router_gating_linear,
     save_to_aux_losses_tracker,
     switch_load_balancing_loss_func,
     z_loss_func,
@@ -28,7 +32,6 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
-    make_sharded_tensors_for_checkpoint,
 )
 
 
@@ -66,6 +69,7 @@ class _MegatronMoE(_SonicMoE):
         std: float,
         router_score_function: str = "softmax",
         router_score_over_topk: bool = True,
+        router_dtype: Optional[str] = None,
         accumulate_wgrad_into_main_grad: bool = False,
     ) -> None:
         _require_sonicmoe()
@@ -80,7 +84,24 @@ class _MegatronMoE(_SonicMoE):
             router_score_function=router_score_function,
             router_score_over_topk=router_score_over_topk,
         )
+        self.megatron_router_dtype = router_dtype
         self.accumulate_wgrad_into_main_grad = accumulate_wgrad_into_main_grad
+        self._maintain_router_param_dtype()
+
+    def _target_router_param_dtype(self) -> torch.dtype:
+        if self.megatron_router_dtype == "fp32":
+            return torch.float32
+        return self.c_fc.weight.dtype
+
+    def _maintain_router_param_dtype(self) -> None:
+        target_dtype = self._target_router_param_dtype()
+        if self.router.weight.dtype != target_dtype:
+            self.router.to(dtype=target_dtype)
+
+    def _apply(self, fn):
+        module = super()._apply(fn)
+        self._maintain_router_param_dtype()
+        return module
 
 
 def _import_sonicmoe_functional():
@@ -216,9 +237,11 @@ def _check_supported_config(config: TransformerConfig) -> None:
 
 
 def _set_sonic_param_dtypes(module: torch.nn.Module, config: TransformerConfig) -> None:
-    module.router.to(dtype=torch.float32)
     module.c_fc.to(dtype=config.params_dtype)
     module.c_proj.to(dtype=config.params_dtype)
+    module.router.to(
+        dtype=torch.float32 if config.moe_router_dtype == "fp32" else config.params_dtype
+    )
 
 
 def _maybe_move_to_runtime_device(module: torch.nn.Module, config: TransformerConfig) -> None:
@@ -331,6 +354,7 @@ class SonicMoELayer(MoELayer):
             std=config.init_method_std,
             router_score_function=config.moe_router_score_function,
             router_score_over_topk=self._score_over_topk(),
+            router_dtype=config.moe_router_dtype,
             accumulate_wgrad_into_main_grad=config.gradient_accumulation_fusion,
         )
         _maybe_move_to_runtime_device(self.sonic_moe, config)
@@ -338,6 +362,11 @@ class SonicMoELayer(MoELayer):
 
         for param in self.sonic_moe.parameters():
             setattr(param, "allreduce", True)
+
+    def _apply(self, fn):
+        module = super()._apply(fn)
+        self.sonic_moe._maintain_router_param_dtype()
+        return module
 
     def set_layer_number(self, layer_number: int):
         self.layer_number = layer_number
@@ -447,6 +476,13 @@ class SonicMoELayer(MoELayer):
             f"Invalid score_function: {self.config.moe_router_score_function}"
         )
 
+    def _router_dtype(self, input: torch.Tensor) -> torch.dtype:
+        if self.config.moe_router_dtype == "fp32":
+            return torch.float32
+        if self.config.moe_router_dtype == "fp64":
+            return torch.float64
+        return input.dtype
+
     def _sonic_tc_forward(
         self,
         hidden_states: torch.Tensor,
@@ -463,7 +499,12 @@ class SonicMoELayer(MoELayer):
 
         original_shape = hidden_states.shape
         x = hidden_states.view(-1, self.config.hidden_size)
-        router_logits = F.linear(x.float(), self.sonic_moe.router.weight)
+        router_logits = router_gating_linear(
+            x,
+            self.sonic_moe.router.weight,
+            self.sonic_moe.router.bias,
+            self._router_dtype(x),
+        )
         num_experts = self.sonic_moe.router.weight.size(0)
         topk_scores, topk_indices = self._apply_sonic_router_topk(
             TC_Softmax_Topk_Router_Function,
@@ -773,14 +814,147 @@ class SonicMoELayer(MoELayer):
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         metadata = ensure_metadata_has_dp_cp_group(metadata)
-        return make_sharded_tensors_for_checkpoint(
-            self._origin_state_dict_entries("", keep_vars=True),
-            prefix,
-            {},
-            sharded_offsets=sharded_offsets,
-            tp_group=self.tp_group,
-            dp_cp_group=metadata["dp_cp_group"],
-        )
+        dp_cp_group = metadata["dp_cp_group"]
+        prepend_axis_num = len(sharded_offsets)
+        ep_rank = get_pg_rank(self.ep_group)
+        ep_size = get_pg_size(self.ep_group)
+        tp_rank = get_pg_rank(self.tp_group)
+        tp_size = get_pg_size(self.tp_group)
+        dp_rank = get_pg_rank(dp_cp_group)
+        replica_id = (0, 0, dp_rank)
+
+        def fc1_build_fn(key, tensor, replica_id, flattened_range):
+            if flattened_range is not None:
+                raise ValueError("SonicMoELayer does not support flattened-range MoE fc1 checkpointing.")
+            tensor = (
+                tensor.view(
+                    self.config.num_moe_experts,
+                    self.config.hidden_size,
+                    2 * self.config.moe_ffn_hidden_size,
+                )
+                .transpose(1, 2)
+                .contiguous()
+            )
+            gate_weight, up_weight = torch.chunk(tensor, 2, dim=1)
+            return [
+                ShardedTensor.from_rank_offsets(
+                    key,
+                    gate_weight.contiguous(),
+                    *sharded_offsets,
+                    (prepend_axis_num, ep_rank, ep_size),
+                    (prepend_axis_num + 1, tp_rank, tp_size * 2),
+                    replica_id=replica_id,
+                    prepend_axis_num=prepend_axis_num,
+                ),
+                ShardedTensor.from_rank_offsets(
+                    key,
+                    up_weight.contiguous(),
+                    *sharded_offsets,
+                    (prepend_axis_num, ep_rank, ep_size),
+                    (prepend_axis_num + 1, tp_size + tp_rank, tp_size * 2),
+                    replica_id=replica_id,
+                    prepend_axis_num=prepend_axis_num,
+                ),
+            ]
+
+        def fc1_merge_fn(sub_state_dict):
+            if isinstance(sub_state_dict, dict):
+                assert sub_state_dict["singleton_local_shards"]
+                sub_state_dict = torch.cat(
+                    (
+                        torch.stack(sub_state_dict["data"]["w"]),
+                        torch.stack(sub_state_dict["data"]["v"]),
+                    ),
+                    dim=-2,
+                )
+            else:
+                sub_state_dict = torch.cat(sub_state_dict, dim=-2)
+            return (
+                sub_state_dict.transpose(1, 2)
+                .contiguous()
+                .view(
+                    self.config.hidden_size,
+                    self.config.num_moe_experts * 2 * self.config.moe_ffn_hidden_size,
+                )
+            )
+
+        def fc2_build_fn(key, tensor, replica_id, flattened_range):
+            if flattened_range is not None:
+                raise ValueError("SonicMoELayer does not support flattened-range MoE fc2 checkpointing.")
+            tensor = (
+                tensor.view(
+                    self.config.num_moe_experts,
+                    self.config.moe_ffn_hidden_size,
+                    self.config.hidden_size,
+                )
+                .transpose(1, 2)
+                .contiguous()
+            )
+            return ShardedTensor.from_rank_offsets(
+                key,
+                tensor.contiguous(),
+                *sharded_offsets,
+                (prepend_axis_num, ep_rank, ep_size),
+                (prepend_axis_num + 2, tp_rank, tp_size),
+                replica_id=replica_id,
+                prepend_axis_num=prepend_axis_num,
+            )
+
+        def fc2_merge_fn(sub_state_dict):
+            if isinstance(sub_state_dict, dict):
+                assert sub_state_dict["singleton_local_shards"]
+                sub_state_dict = torch.stack(sub_state_dict["data"])
+            return (
+                sub_state_dict.transpose(1, 2)
+                .contiguous()
+                .view(
+                    self.config.num_moe_experts * self.config.moe_ffn_hidden_size,
+                    self.config.hidden_size,
+                )
+            )
+
+        sharded_state_dict = {
+            f"{prefix}router.weight": make_sharded_tensor_for_checkpoint(
+                self.sonic_moe.router.weight,
+                f"{prefix}router.weight",
+                prepend_offsets=sharded_offsets,
+                tp_group=self.tp_group,
+                dp_cp_group=dp_cp_group,
+            ),
+            f"{prefix}experts.weight1": ShardedTensorFactory(
+                f"{prefix}experts.experts.linear_fc1.weight",
+                self._origin_grouped_fc1_weight(keep_vars=True),
+                fc1_build_fn,
+                fc1_merge_fn,
+                replica_id,
+            ),
+            f"{prefix}experts.weight2": ShardedTensorFactory(
+                f"{prefix}experts.experts.linear_fc2.weight",
+                self._origin_grouped_fc2_weight(keep_vars=True),
+                fc2_build_fn,
+                fc2_merge_fn,
+                replica_id,
+            ),
+        }
+
+        if self.sonic_moe.c_fc.bias is not None:
+            sharded_state_dict[f"{prefix}experts.linear_fc1.bias"] = make_sharded_tensor_for_checkpoint(
+                self.sonic_moe.c_fc.bias,
+                f"{prefix}experts.experts.linear_fc1.bias",
+                prepend_offsets=sharded_offsets,
+                tp_group=self.tp_group,
+                dp_cp_group=dp_cp_group,
+            )
+        if self.sonic_moe.c_proj.bias is not None:
+            sharded_state_dict[f"{prefix}experts.linear_fc2.bias"] = make_sharded_tensor_for_checkpoint(
+                self.sonic_moe.c_proj.bias,
+                f"{prefix}experts.experts.linear_fc2.bias",
+                prepend_offsets=sharded_offsets,
+                tp_group=self.tp_group,
+                dp_cp_group=dp_cp_group,
+            )
+
+        return sharded_state_dict
 
     def _move_if_present(self, state_dict, src_key: str, dst_key: str) -> None:
         if dst_key not in state_dict and src_key in state_dict:
@@ -844,13 +1018,25 @@ class SonicMoELayer(MoELayer):
             state_dict, f"{prefix}experts.linear_fc1.weight", f"{prefix}sonic_moe.c_fc.weight"
         )
         self._move_if_present(
+            state_dict, f"{prefix}experts.experts.linear_fc1.weight", f"{prefix}sonic_moe.c_fc.weight"
+        )
+        self._move_if_present(
             state_dict, f"{prefix}experts.linear_fc1.bias", f"{prefix}sonic_moe.c_fc.bias"
+        )
+        self._move_if_present(
+            state_dict, f"{prefix}experts.experts.linear_fc1.bias", f"{prefix}sonic_moe.c_fc.bias"
         )
         self._move_if_present(
             state_dict, f"{prefix}experts.linear_fc2.weight", f"{prefix}sonic_moe.c_proj.weight"
         )
         self._move_if_present(
+            state_dict, f"{prefix}experts.experts.linear_fc2.weight", f"{prefix}sonic_moe.c_proj.weight"
+        )
+        self._move_if_present(
             state_dict, f"{prefix}experts.linear_fc2.bias", f"{prefix}sonic_moe.c_proj.bias"
+        )
+        self._move_if_present(
+            state_dict, f"{prefix}experts.experts.linear_fc2.bias", f"{prefix}sonic_moe.c_proj.bias"
         )
         self._stack_per_expert_if_present(
             state_dict,
