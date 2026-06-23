@@ -81,6 +81,41 @@ def condition_init_method(config, init_method):
     return init_method if config.perform_initialization else (lambda w: None)
 
 
+def _te_dot_product_attention_accepts_argument(argument_name: str) -> bool:
+    """Return whether the installed TE DPA forward accepts a Megatron extension kwarg."""
+    return argument_name in inspect.signature(te.pytorch.DotProductAttention.forward).parameters
+
+
+def _packed_seq_kwargs_for_te(
+    packed_seq_params: PackedSeqParams,
+    kept_packed_seq_params: set[str],
+    supports_tree_metadata: bool,
+) -> dict[str, Any]:
+    """Build the TransformerEngine packed-sequence kwargs Megatron owns.
+
+    ``PackedSeqParams.tree_metadata`` is a Megatron-side extension field. It
+    must not leak as a ``None`` kwarg into ordinary TE attention calls. When
+    populated, it is a real tree-training request and therefore requires a TE
+    build whose DPA explicitly accepts ``tree_metadata``.
+    """
+    packed_seq_kwargs = {
+        key: getattr(packed_seq_params, key)
+        for key in kept_packed_seq_params
+        if key != "tree_metadata"
+    }
+    if packed_seq_params.tree_metadata is None:
+        return packed_seq_kwargs
+    if not supports_tree_metadata:
+        raise RuntimeError(
+            "PackedSeqParams.tree_metadata requires TransformerEngine "
+            "DotProductAttention.forward(..., tree_metadata=...), but the installed "
+            f"TransformerEngine v{get_te_version()} does not expose that argument. "
+            "Use a tree-attention-capable TransformerEngine build or disable tree training."
+        )
+    packed_seq_kwargs["tree_metadata"] = packed_seq_params.tree_metadata
+    return packed_seq_kwargs
+
+
 def split_te_layernorm_column_parallel_linear(
     fused_layer,
     config,
@@ -1006,6 +1041,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.kept_packed_seq_params = set(
             field.name for field in dataclasses.fields(PackedSeqParams)
         )
+        self.kept_packed_seq_params.discard("tree_metadata")
+        self._te_supports_tree_metadata = _te_dot_product_attention_accepts_argument(
+            "tree_metadata"
+        )
 
         if get_te_version() < PkgVersion("1.3.0"):
             # TE 1.3.0 introduces precomputing max_seqlen to remove unnecessary kernels and D2H
@@ -1077,7 +1116,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             self.kept_packed_seq_params.discard("cp_group")
             self.kept_packed_seq_params.discard("local_cp_size")
         packed_seq_kwargs = (
-            {key: getattr(packed_seq_params, key) for key in self.kept_packed_seq_params}
+            _packed_seq_kwargs_for_te(
+                packed_seq_params,
+                self.kept_packed_seq_params,
+                self._te_supports_tree_metadata,
+            )
             if packed_seq_params is not None
             else {}
         )

@@ -3,11 +3,13 @@
 import pytest
 import torch
 
+from megatron.core.extensions.transformer_engine import _packed_seq_kwargs_for_te
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.tree_metadata import TreeMetadata
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -42,6 +44,63 @@ def make_test_packed_padded_seq_params(sequence_length):
         qkv_format='thd',
     )
     return packed_seq_params
+
+
+def test_packed_seq_kwargs_omit_empty_tree_metadata():
+    packed_seq_params = PackedSeqParams(
+        cu_seqlens_q=torch.IntTensor([0, 1]),
+        cu_seqlens_kv=torch.IntTensor([0, 1]),
+        max_seqlen_q=1,
+        max_seqlen_kv=1,
+        qkv_format='thd',
+    )
+
+    kwargs = _packed_seq_kwargs_for_te(
+        packed_seq_params,
+        {"qkv_format", "cu_seqlens_q", "max_seqlen_q", "tree_metadata"},
+        supports_tree_metadata=False,
+    )
+
+    assert kwargs["qkv_format"] == 'thd'
+    assert kwargs["max_seqlen_q"] == 1
+    assert "tree_metadata" not in kwargs
+
+
+def test_packed_seq_kwargs_reject_tree_metadata_without_te_support():
+    tree_metadata = TreeMetadata(
+        cu_node_lens=torch.IntTensor([0, 1]),
+        node_parent=torch.IntTensor([-1]),
+        tree_position_ids=torch.LongTensor([0]),
+        padded_size=1,
+        num_nodes=1,
+    )
+    packed_seq_params = PackedSeqParams(qkv_format='thd', tree_metadata=tree_metadata)
+
+    with pytest.raises(RuntimeError, match="tree_metadata requires TransformerEngine"):
+        _packed_seq_kwargs_for_te(
+            packed_seq_params,
+            {"qkv_format", "tree_metadata"},
+            supports_tree_metadata=False,
+        )
+
+
+def test_packed_seq_kwargs_pass_tree_metadata_when_te_supports_it():
+    tree_metadata = TreeMetadata(
+        cu_node_lens=torch.IntTensor([0, 1]),
+        node_parent=torch.IntTensor([-1]),
+        tree_position_ids=torch.LongTensor([0]),
+        padded_size=1,
+        num_nodes=1,
+    )
+    packed_seq_params = PackedSeqParams(qkv_format='thd', tree_metadata=tree_metadata)
+
+    kwargs = _packed_seq_kwargs_for_te(
+        packed_seq_params,
+        {"qkv_format", "tree_metadata"},
+        supports_tree_metadata=True,
+    )
+
+    assert kwargs["tree_metadata"] is tree_metadata
 
 
 class TestParallelAttentionWithPackedSequence:
