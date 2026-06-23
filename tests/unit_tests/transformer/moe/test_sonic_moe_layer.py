@@ -59,7 +59,7 @@ def _ep2_dcp_expected_tensors(config, device):
             device=device,
         ).view(config.num_moe_experts, config.hidden_size)
         / 100.0
-    )
+    ).to(dtype=config.params_dtype)
     fc1 = torch.arange(
         config.num_moe_experts * 2 * config.moe_ffn_hidden_size * config.hidden_size,
         dtype=torch.float32,
@@ -154,7 +154,6 @@ class TestSonicMoELayerRouterLoss:
     def _new_topk_router(self, config):
         router = TopKRouter(config=config, pg_collection=get_default_pg_collection()).cuda()
         router.set_layer_number(0)
-        router.weight.data = router.weight.data.float()
         return router
 
     def _new_sonic_layer(self, config):
@@ -208,7 +207,21 @@ class TestSonicMoELayerRouterLoss:
             layer.sonic_moe.accumulate_wgrad_into_main_grad
             is self.default_config.gradient_accumulation_fusion
         )
-        assert layer.sonic_moe.router.weight.dtype is torch.float32
+        assert layer.sonic_moe.router.weight.dtype is self.default_config.params_dtype
+        assert (
+            layer._router_dtype(torch.empty(1, device="cuda", dtype=torch.bfloat16))
+            is torch.float32
+        )
+        router_input = torch.empty(
+            1, 1, self.default_config.hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+        router_logits = router_gating_linear(
+            router_input,
+            layer.sonic_moe.router.weight,
+            layer.sonic_moe.router.bias,
+            layer._router_dtype(router_input),
+        )
+        assert router_logits.dtype is torch.float32
         assert layer.sonic_moe.c_fc.weight.dtype is torch.bfloat16
         assert layer.sonic_moe.c_proj.weight.dtype is torch.bfloat16
         if layer.sonic_moe.c_fc.bias is not None:
@@ -217,7 +230,11 @@ class TestSonicMoELayerRouterLoss:
             assert layer.sonic_moe.c_proj.bias.dtype is torch.bfloat16
 
         wrapped_layer = Float16Module(self.default_config, self._new_sonic_layer(self.default_config))
-        assert wrapped_layer.module.sonic_moe.router.weight.dtype is torch.float32
+        assert wrapped_layer.module.sonic_moe.router.weight.dtype is self.default_config.params_dtype
+        assert (
+            wrapped_layer.module._router_dtype(torch.empty(1, device="cuda", dtype=torch.bfloat16))
+            is torch.float32
+        )
         assert wrapped_layer.module.sonic_moe.c_fc.weight.dtype is torch.bfloat16
         assert wrapped_layer.module.sonic_moe.c_proj.weight.dtype is torch.bfloat16
 
@@ -396,7 +413,7 @@ class TestSonicMoELayerRouterLoss:
                 rtol=EXACT_RTOL,
                 atol=EXACT_ATOL,
             )
-            assert sonic["router_weight_grad"].dtype is torch.float32
+            assert sonic["router_weight_grad"].dtype is config.params_dtype
             torch.testing.assert_close(
                 sonic["router_weight_grad"],
                 ref["router_weight_grad"],
@@ -459,7 +476,7 @@ class TestSonicMoELayerRouterLoss:
         assert "global_load_balancing_loss" in tracker
         assert hidden_state.grad.dtype is torch.bfloat16
         assert torch.isfinite(hidden_state.grad).all()
-        assert layer.sonic_moe.router.weight.grad.dtype is torch.float32
+        assert layer.sonic_moe.router.weight.grad.dtype is config.params_dtype
         assert torch.isfinite(layer.sonic_moe.router.weight.grad).all()
         assert layer.sonic_moe.c_fc.weight.grad.dtype is torch.bfloat16
         assert torch.isfinite(layer.sonic_moe.c_fc.weight.grad).all()
@@ -690,7 +707,7 @@ class TestSonicMoELayerRouterLoss:
         torch.testing.assert_close(
             layer.sonic_moe.c_proj.weight, fc2, rtol=EXACT_RTOL, atol=EXACT_ATOL
         )
-        assert layer.sonic_moe.router.weight.dtype is torch.float32
+        assert layer.sonic_moe.router.weight.dtype is config.params_dtype
 
         dist_checkpointing.save(
             layer.sharded_state_dict(prefix=EP2_DCP_PREFIX),
@@ -732,7 +749,7 @@ class TestSonicMoELayerRouterLoss:
                 config.num_moe_experts,
                 config.hidden_size,
                 device="cuda",
-                dtype=torch.float32,
+                dtype=config.params_dtype,
             ),
             "experts.weight1": torch.randn(
                 weight1_shape, device="cuda", dtype=config.params_dtype

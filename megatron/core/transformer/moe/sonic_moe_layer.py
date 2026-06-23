@@ -89,8 +89,6 @@ class _MegatronMoE(_SonicMoE):
         self._maintain_router_param_dtype()
 
     def _target_router_param_dtype(self) -> torch.dtype:
-        if self.megatron_router_dtype == "fp32":
-            return torch.float32
         return self.c_fc.weight.dtype
 
     def _maintain_router_param_dtype(self) -> None:
@@ -239,9 +237,7 @@ def _check_supported_config(config: TransformerConfig) -> None:
 def _set_sonic_param_dtypes(module: torch.nn.Module, config: TransformerConfig) -> None:
     module.c_fc.to(dtype=config.params_dtype)
     module.c_proj.to(dtype=config.params_dtype)
-    module.router.to(
-        dtype=torch.float32 if config.moe_router_dtype == "fp32" else config.params_dtype
-    )
+    module.router.to(dtype=config.params_dtype)
 
 
 def _maybe_move_to_runtime_device(module: torch.nn.Module, config: TransformerConfig) -> None:
