@@ -129,7 +129,7 @@ def parse_args():
     parser.add_argument(
         "--result-file-grace",
         type=int,
-        default=300,
+        default=1800,
         help="Seconds to wait for the shared result file after SiFlow reports task success.",
     )
     parser.add_argument(
@@ -288,12 +288,14 @@ def wait_for_task(client, uuid, args):
             if success_without_result_since is None:
                 success_without_result_since = now
                 print(
-                    "[wait] SiFlow reports success; waiting for required CI result file.",
+                    "[wait] SiFlow reports success; waiting up to "
+                    f"{args.result_file_grace}s for required CI result file.",
                     flush=True,
                 )
             elif now - success_without_result_since >= args.result_file_grace:
                 print(
-                    "[wait] SiFlow task finished, but no final CI result file was written.",
+                    "[wait] SiFlow task finished, but no final CI result file was visible at "
+                    f"{result_path}.",
                     flush=True,
                 )
                 return 1

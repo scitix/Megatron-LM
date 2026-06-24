@@ -141,6 +141,11 @@ on:
         required: true
         type: number
         default: 21600
+      result_file_grace:
+        description: "Seconds to wait for final result.json after SiFlow reports success"
+        required: true
+        type: number
+        default: 1800
 
 permissions:
   contents: read
@@ -185,6 +190,7 @@ jobs:
       SIFLOW_ENABLE_LIGHTWEIGHT_MODE: ${{ inputs.enable_lightweight_mode || 'false' }}
       SIFLOW_POLL_INTERVAL: ${{ inputs.poll_interval || '60' }}
       SIFLOW_WAIT_TIMEOUT: ${{ inputs.wait_timeout || '21600' }}
+      SIFLOW_RESULT_FILE_GRACE: ${{ inputs.result_file_grace || '1800' }}
       REPO_CLONE_TOKEN: ${{ secrets.REPO_CLONE_TOKEN }}
 
     steps:
@@ -288,6 +294,7 @@ jobs:
           CI root:        ${SIFLOW_CI_ROOT}/${{ github.sha }}
           Wait timeout:   ${SIFLOW_WAIT_TIMEOUT}s
           Poll interval:  ${SIFLOW_POLL_INTERVAL}s
+          Result grace:   ${SIFLOW_RESULT_FILE_GRACE}s
           Command:        ${SIFLOW_CMD:-<submitter default>}
           Commit:         ${{ github.sha }}
           EOF
@@ -333,7 +340,8 @@ jobs:
             --enable-lightweight-mode "${SIFLOW_ENABLE_LIGHTWEIGHT_MODE}" \
             --wait \
             --poll-interval "${SIFLOW_POLL_INTERVAL}" \
-            --wait-timeout "${SIFLOW_WAIT_TIMEOUT}"
+            --wait-timeout "${SIFLOW_WAIT_TIMEOUT}" \
+            --result-file-grace "${SIFLOW_RESULT_FILE_GRACE}"
           )
 
           if [[ -n "${SIFLOW_CMD}" ]]; then
@@ -369,5 +377,6 @@ jobs:
             echo "- Test specs: \`${SIFLOW_TEST_SPECS:-${SIFLOW_TEST_MODEL}/${SIFLOW_TEST_CASE}}\`"
             echo "- Wait timeout: \`${SIFLOW_WAIT_TIMEOUT}s\`"
             echo "- Poll interval: \`${SIFLOW_POLL_INTERVAL}s\`"
+            echo "- Result grace: \`${SIFLOW_RESULT_FILE_GRACE}s\`"
             echo "- Commit: \`${{ github.sha }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
