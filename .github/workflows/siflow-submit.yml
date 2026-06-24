@@ -141,11 +141,6 @@ on:
         required: true
         type: number
         default: 21600
-      result_file_grace:
-        description: "Seconds to wait for final result.json after SiFlow reports success"
-        required: true
-        type: number
-        default: 1800
 
 permissions:
   contents: read
@@ -190,7 +185,7 @@ jobs:
       SIFLOW_ENABLE_LIGHTWEIGHT_MODE: ${{ inputs.enable_lightweight_mode || 'false' }}
       SIFLOW_POLL_INTERVAL: ${{ inputs.poll_interval || '60' }}
       SIFLOW_WAIT_TIMEOUT: ${{ inputs.wait_timeout || '21600' }}
-      SIFLOW_RESULT_FILE_GRACE: ${{ inputs.result_file_grace || '1800' }}
+      SIFLOW_RESULT_FILE_GRACE: "1800"
       REPO_CLONE_TOKEN: ${{ secrets.REPO_CLONE_TOKEN }}
 
     steps:
