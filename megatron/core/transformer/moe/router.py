@@ -7,6 +7,7 @@ import torch
 
 from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
+from megatron.core.transformer.moe import expert_stats
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
@@ -539,6 +540,24 @@ class TopKRouter(Router):
 
         # Optionally apply expert bias
         self._apply_expert_bias(routing_map)
+
+        # Optional MoE expert-routing stats capture (Scitix). Cheap bool short-circuit
+        # when disabled. Fires for stock TopKRouter callers; subclasses that fully
+        # override routing() without super() must call save_expert_stats themselves.
+        # Guard mirrors the aux-loss guard above: only the grad-enabled train forward.
+        if (
+            self.training
+            and torch.is_grad_enabled()
+            and expert_stats.is_enabled()
+            and self.layer_number is not None
+        ):
+            expert_stats.save_expert_stats(
+                routing_map=routing_map,
+                probs=probs,
+                layer_number=self.layer_number,
+                num_layers=self.config.num_layers,
+                num_experts=self.config.num_moe_experts,
+            )
 
         return probs, routing_map
 

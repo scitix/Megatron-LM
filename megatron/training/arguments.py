@@ -69,6 +69,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_biencoder_args(parser)
     parser = _add_vision_args(parser)
     parser = _add_moe_args(parser)
+    parser = _add_expert_stats_args(parser)
     parser = _add_mla_args(parser)
     parser = _add_experimental_attention_variant_args(parser)
     parser = _add_heterogeneous_args(parser)
@@ -3355,6 +3356,27 @@ def _add_mla_args(parser):
                        help="Mscale all dimensions for YaRN RoPE in multi-latent attention.")
     group.add_argument('--cache-mla-latents', action='store_true', default=False,
                        help="If set caches the mla down projected latents with mla flash decode.")
+
+    return parser
+
+def _add_expert_stats_args(parser):
+    # Named _add_*_args so structured submit passthrough (e.g. slime
+    # jobs/launcher/submission/upstream_args.py) discovers the group and renders
+    # megatron.expert_stats.* YAML to --expert-stats-* flags.
+    group = parser.add_argument_group(title="expert_stats")
+    group.add_argument('--expert-stats-log-interval', type=int, default=0,
+                       help='Log MoE per-expert routing stats every N training steps. '
+                            'Must be >= 0; 0 = disabled (default). Negative is rejected at '
+                            'configure time.')
+    group.add_argument('--expert-stats-heatmap-interval', type=int, default=10,
+                       help='Render an expert-token heatmap PNG every N steps (aligned with the '
+                            'log cadence). <=0 disables heatmaps; scalars + JSONL still log.')
+    group.add_argument('--expert-stats-output-dir', type=str, default=None,
+                       help='Output dir for expert-stats heatmaps/JSONL. Relative paths resolve '
+                            'under RUN_LOG_DIR; an explicit relative path stays relative when '
+                            'RUN_LOG_DIR is unset; default falls back to {save}/expert_stats.')
+    group.add_argument('--expert-stats-per-layer-logging', action='store_true', default=False,
+                       help='Also emit per-expert detail scalars (moe_expert_detail/...).')
 
     return parser
 
