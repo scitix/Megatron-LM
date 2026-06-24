@@ -336,7 +336,8 @@ jobs:
             --wait \
             --poll-interval "${SIFLOW_POLL_INTERVAL}" \
             --wait-timeout "${SIFLOW_WAIT_TIMEOUT}" \
-            --result-file-grace "${SIFLOW_RESULT_FILE_GRACE}"
+            --result-file-grace "${SIFLOW_RESULT_FILE_GRACE}" \
+            --no-require-result-file
           )
 
           if [[ -n "${SIFLOW_CMD}" ]]; then
