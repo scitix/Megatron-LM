@@ -1,0 +1,371 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Submit SiFlow Workload
+
+on:
+  pull_request:
+    branches:
+      - ci-dev
+  workflow_dispatch:
+    inputs:
+      submitter_path:
+        description: "Python submitter script path"
+        required: true
+        type: string
+        default: "ci/submit_siflow_job.py"
+      exp_name:
+        description: "Experiment name prefix. The short commit SHA is appended."
+        required: true
+        type: string
+        default: "ci-test"
+      nodes:
+        description: "Total nodes, including master"
+        required: true
+        type: number
+        default: 1
+      region:
+        description: "SiFlow region"
+        required: true
+        type: string
+        default: "ap-southeast"
+      cluster:
+        description: "SiFlow cluster"
+        required: true
+        type: string
+        default: "aries"
+      resource_pool:
+        description: "Resource pool"
+        required: true
+        type: string
+        default: "ls-cpt"
+      instance:
+        description: "Instance type"
+        required: true
+        type: string
+        default: "sci.g20-3"
+      count_per_pod:
+        description: "GPU/device count per pod"
+        required: true
+        type: number
+        default: 8
+      image:
+        description: "Image name"
+        required: true
+        type: string
+        default: "miles"
+      image_version:
+        description: "Image version"
+        required: true
+        type: string
+        default: "deepseek-v4"
+      image_url:
+        description: "Image URL"
+        required: true
+        type: string
+        default: "radixark/miles:deepseek-v4"
+      image_type:
+        description: "Image type"
+        required: true
+        type: string
+        default: "radixark"
+      priority:
+        description: "Task priority"
+        required: true
+        type: choice
+        options:
+          - low
+          - medium
+          - high
+        default: "medium"
+      cmd:
+        description: "Optional command override. Leave empty for golden-value verification."
+        required: false
+        type: string
+        default: ""
+      test_specs:
+        description: "Semicolon-separated model:test_case[:training_script] entries. Default runs dense and MoE."
+        required: false
+        type: string
+        default: "gpt:gpt3_mcore_te_tp1_pp1_dist_optimizer_commoncrawl_deepseek_tokenizer;moe:gpt3_moe_mcore_te_tp2_pp1_ep2_dist_optimizer_commoncrawl_deepseek_tokenizer"
+      test_model:
+        description: "Fallback functional test model group when test_specs is empty"
+        required: true
+        type: string
+        default: "gpt"
+      test_case:
+        description: "Fallback functional test case when test_specs is empty"
+        required: true
+        type: string
+        default: "gpt3_mcore_te_tp1_pp1_dist_optimizer_commoncrawl_deepseek_tokenizer"
+      test_environment:
+        description: "Golden-values environment"
+        required: true
+        type: string
+        default: "dev"
+      test_platform:
+        description: "Golden-values platform"
+        required: true
+        type: string
+        default: "dgx_h100"
+      data_path:
+        description: "Read-only dataset root"
+        required: true
+        type: string
+        default: "/volume/hisys"
+      checkpoint_load_path:
+        description: "Checkpoint load root. Leave empty for a commit-local path."
+        required: false
+        type: string
+        default: ""
+      ci_root:
+        description: "CI output root; commit SHA is appended"
+        required: true
+        type: string
+        default: "/volume/hisys/ci/Megatron-LM"
+      enable_lightweight_mode:
+        description: "Set true to smoke test without golden pytest comparison"
+        required: true
+        type: choice
+        options:
+          - "false"
+          - "true"
+        default: "false"
+      poll_interval:
+        description: "Seconds between SiFlow status polls in blocking mode"
+        required: true
+        type: number
+        default: 60
+      wait_timeout:
+        description: "Maximum seconds to wait for the remote SiFlow result"
+        required: true
+        type: number
+        default: 21600
+
+permissions:
+  contents: read
+
+concurrency:
+  group: siflow-submit-${{ github.ref_name }}-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  submit:
+    name: Submit workload
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 420
+
+    env:
+      SCITIX_AK: ${{ secrets.SCITIX_AK }}
+      SCITIX_SK: ${{ secrets.SCITIX_SK }}
+      SIFLOW_SOURCE_REF: ${{ github.head_ref || github.ref_name }}
+      SIFLOW_GITHUB_REF: ${{ github.ref }}
+      SIFLOW_SUBMITTER_PATH: ${{ inputs.submitter_path || 'ci/submit_siflow_job.py' }}
+      SIFLOW_EXP_NAME_PREFIX: ${{ inputs.exp_name || 'ci-test' }}
+      SIFLOW_NODES: ${{ inputs.nodes || '1' }}
+      SIFLOW_REGION: ${{ inputs.region || 'ap-southeast' }}
+      SIFLOW_CLUSTER: ${{ inputs.cluster || 'aries' }}
+      SIFLOW_RESOURCE_POOL: ${{ inputs.resource_pool || 'ls-cpt' }}
+      SIFLOW_INSTANCE: ${{ inputs.instance || 'sci.g20-3' }}
+      SIFLOW_COUNT_PER_POD: ${{ inputs.count_per_pod || '8' }}
+      SIFLOW_IMAGE: ${{ inputs.image || 'miles' }}
+      SIFLOW_IMAGE_VERSION: ${{ inputs.image_version || 'deepseek-v4' }}
+      SIFLOW_IMAGE_URL: ${{ inputs.image_url || 'radixark/miles:deepseek-v4' }}
+      SIFLOW_IMAGE_TYPE: ${{ inputs.image_type || 'radixark' }}
+      SIFLOW_PRIORITY: ${{ inputs.priority || 'medium' }}
+      SIFLOW_CMD: ${{ inputs.cmd || '' }}
+      SIFLOW_TEST_SPECS: ${{ inputs.test_specs || 'gpt:gpt3_mcore_te_tp1_pp1_dist_optimizer_commoncrawl_deepseek_tokenizer;moe:gpt3_moe_mcore_te_tp2_pp1_ep2_dist_optimizer_commoncrawl_deepseek_tokenizer' }}
+      SIFLOW_TEST_MODEL: ${{ inputs.test_model || 'gpt' }}
+      SIFLOW_TEST_CASE: ${{ inputs.test_case || 'gpt3_mcore_te_tp1_pp1_dist_optimizer_commoncrawl_deepseek_tokenizer' }}
+      SIFLOW_TEST_ENVIRONMENT: ${{ inputs.test_environment || 'dev' }}
+      SIFLOW_TEST_PLATFORM: ${{ inputs.test_platform || 'dgx_h100' }}
+      SIFLOW_DATA_PATH: ${{ inputs.data_path || '/volume/hisys' }}
+      SIFLOW_CHECKPOINT_LOAD_PATH: ${{ inputs.checkpoint_load_path || '' }}
+      SIFLOW_CI_ROOT: ${{ inputs.ci_root || '/volume/hisys/ci/Megatron-LM' }}
+      SIFLOW_ENABLE_LIGHTWEIGHT_MODE: ${{ inputs.enable_lightweight_mode || 'false' }}
+      SIFLOW_POLL_INTERVAL: ${{ inputs.poll_interval || '60' }}
+      SIFLOW_WAIT_TIMEOUT: ${{ inputs.wait_timeout || '21600' }}
+      REPO_CLONE_TOKEN: ${{ secrets.REPO_CLONE_TOKEN }}
+
+    steps:
+      - name: Validate branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch="${SIFLOW_SOURCE_REF}"
+          case "${branch}" in
+            ci/*) ;;
+            *)
+              echo "This workflow only submits from ci/* branches. Selected branch: ${branch}"
+              exit 1
+              ;;
+          esac
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve Python
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then
+            python_bin="$(command -v python3)"
+          elif command -v python >/dev/null 2>&1; then
+            python_bin="$(command -v python)"
+          else
+            echo "Neither python3 nor python was found on PATH."
+            exit 1
+          fi
+
+          echo "SIFLOW_PYTHON=${python_bin}" >> "$GITHUB_ENV"
+          "${python_bin}" --version
+
+      - name: Validate secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${SCITIX_AK:-}" || { echo "Missing GitHub secret: SCITIX_AK"; exit 1; }
+          test -n "${SCITIX_SK:-}" || { echo "Missing GitHub secret: SCITIX_SK"; exit 1; }
+          test -n "${REPO_CLONE_TOKEN:-}" || { echo "Missing GitHub secret: REPO_CLONE_TOKEN"; exit 1; }
+
+      - name: Validate golden test files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${SIFLOW_TEST_SPECS:-}" ]]; then
+            IFS=';' read -r -a test_specs <<< "${SIFLOW_TEST_SPECS}"
+          else
+            test_specs=("${SIFLOW_TEST_MODEL}:${SIFLOW_TEST_CASE}")
+          fi
+
+          for spec in "${test_specs[@]}"; do
+            IFS=':' read -r test_model test_case _ <<< "${spec}"
+            if [[ -z "${test_model}" || -z "${test_case}" ]]; then
+              echo "Invalid test spec: ${spec}"
+              echo "Expected format: model:test_case[:training_script]"
+              exit 1
+            fi
+
+            config_path="tests/functional_tests/test_cases/${test_model}/${test_case}/model_config.yaml"
+            golden_path="tests/functional_tests/test_cases/${test_model}/${test_case}/golden_values_${SIFLOW_TEST_ENVIRONMENT}_${SIFLOW_TEST_PLATFORM}.json"
+
+            test -f "${config_path}" || { echo "Missing model config: ${config_path}"; exit 1; }
+            test -f "${golden_path}" || { echo "Missing golden values: ${golden_path}"; exit 1; }
+          done
+
+      - name: Prepare submit metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA::12}"
+          echo "SIFLOW_EXP_NAME=${SIFLOW_EXP_NAME_PREFIX}-${short_sha}" >> "$GITHUB_ENV"
+
+      - name: Show request
+        shell: bash
+        run: |
+          cat <<EOF
+          Submitter:      ${SIFLOW_SUBMITTER_PATH}
+          Branch:         ${SIFLOW_SOURCE_REF}
+          GitHub ref:     ${SIFLOW_GITHUB_REF}
+          Experiment:     ${SIFLOW_EXP_NAME}
+          Nodes:          ${SIFLOW_NODES}
+          Region:         ${SIFLOW_REGION}
+          Cluster:        ${SIFLOW_CLUSTER}
+          Resource pool:  ${SIFLOW_RESOURCE_POOL}
+          Instance:       ${SIFLOW_INSTANCE}
+          Count per pod:  ${SIFLOW_COUNT_PER_POD}
+          Image:          ${SIFLOW_IMAGE}
+          Image version:  ${SIFLOW_IMAGE_VERSION}
+          Image URL:      ${SIFLOW_IMAGE_URL}
+          Image type:     ${SIFLOW_IMAGE_TYPE}
+          Priority:       ${SIFLOW_PRIORITY}
+          Test specs:     ${SIFLOW_TEST_SPECS:-<single fallback>}
+          Test model:     ${SIFLOW_TEST_MODEL}
+          Test case:      ${SIFLOW_TEST_CASE}
+          Golden target:  ${SIFLOW_TEST_ENVIRONMENT}_${SIFLOW_TEST_PLATFORM}
+          CI root:        ${SIFLOW_CI_ROOT}/${{ github.sha }}
+          Wait timeout:   ${SIFLOW_WAIT_TIMEOUT}s
+          Poll interval:  ${SIFLOW_POLL_INTERVAL}s
+          Command:        ${SIFLOW_CMD:-<submitter default>}
+          Commit:         ${{ github.sha }}
+          EOF
+
+      - name: Submit SiFlow task
+        id: submit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f "${SIFLOW_SUBMITTER_PATH}" || {
+            echo "Submitter script does not exist: ${SIFLOW_SUBMITTER_PATH}"
+            exit 1
+          }
+
+          submit_args=(
+            "${SIFLOW_SUBMITTER_PATH}"
+            --exp-name "${SIFLOW_EXP_NAME}" \
+            --nodes "${SIFLOW_NODES}" \
+            --region "${SIFLOW_REGION}" \
+            --cluster "${SIFLOW_CLUSTER}" \
+            --resource-pool "${SIFLOW_RESOURCE_POOL}" \
+            --instance "${SIFLOW_INSTANCE}" \
+            --count-per-pod "${SIFLOW_COUNT_PER_POD}" \
+            --image "${SIFLOW_IMAGE}" \
+            --image-version "${SIFLOW_IMAGE_VERSION}" \
+            --image-url "${SIFLOW_IMAGE_URL}" \
+            --image-type "${SIFLOW_IMAGE_TYPE}" \
+            --priority "${SIFLOW_PRIORITY}" \
+            --repo "${{ github.repository }}" \
+            --ref "${SIFLOW_SOURCE_REF}" \
+            --github-ref "${SIFLOW_GITHUB_REF}" \
+            --sha "${{ github.sha }}" \
+            --github-token-env REPO_CLONE_TOKEN \
+            --ci-root "${SIFLOW_CI_ROOT}" \
+            --test-specs "${SIFLOW_TEST_SPECS}" \
+            --test-model "${SIFLOW_TEST_MODEL}" \
+            --test-case "${SIFLOW_TEST_CASE}" \
+            --test-environment "${SIFLOW_TEST_ENVIRONMENT}" \
+            --test-platform "${SIFLOW_TEST_PLATFORM}" \
+            --data-path "${SIFLOW_DATA_PATH}" \
+            --checkpoint-load-path "${SIFLOW_CHECKPOINT_LOAD_PATH}" \
+            --enable-lightweight-mode "${SIFLOW_ENABLE_LIGHTWEIGHT_MODE}" \
+            --wait \
+            --poll-interval "${SIFLOW_POLL_INTERVAL}" \
+            --wait-timeout "${SIFLOW_WAIT_TIMEOUT}"
+          )
+
+          if [[ -n "${SIFLOW_CMD}" ]]; then
+            submit_args+=(--cmd "${SIFLOW_CMD}")
+          fi
+
+          set +e
+          "${SIFLOW_PYTHON}" "${submit_args[@]}" | tee submit.log
+          submit_exit="${PIPESTATUS[0]}"
+          set -e
+
+          uuid="$(sed -n 's/.*UUID: //p' submit.log | tail -n 1)"
+          if [[ -n "$uuid" ]]; then
+            echo "uuid=$uuid" >> "$GITHUB_OUTPUT"
+          fi
+
+          exit "${submit_exit}"
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### SiFlow submission"
+            echo
+            echo "- Status: \`${{ job.status }}\`"
+            echo "- UUID: \`${{ steps.submit.outputs.uuid || 'not captured' }}\`"
+            echo "- Branch: \`${SIFLOW_SOURCE_REF}\`"
+            echo "- GitHub ref: \`${SIFLOW_GITHUB_REF}\`"
+            echo "- Experiment: \`${SIFLOW_EXP_NAME:-not prepared}\`"
+            echo "- Nodes: \`${SIFLOW_NODES}\`"
+            echo "- Test specs: \`${SIFLOW_TEST_SPECS:-${SIFLOW_TEST_MODEL}/${SIFLOW_TEST_CASE}}\`"
+            echo "- Wait timeout: \`${SIFLOW_WAIT_TIMEOUT}s\`"
+            echo "- Poll interval: \`${SIFLOW_POLL_INTERVAL}s\`"
+            echo "- Commit: \`${{ github.sha }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
