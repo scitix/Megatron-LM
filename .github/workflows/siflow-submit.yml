@@ -266,6 +266,7 @@ jobs:
         run: |
           cat <<EOF
           Submitter:      ${SIFLOW_SUBMITTER_PATH}
+          Mode:           blocking
           Branch:         ${SIFLOW_SOURCE_REF}
           GitHub ref:     ${SIFLOW_GITHUB_REF}
           Experiment:     ${SIFLOW_EXP_NAME}
@@ -360,6 +361,7 @@ jobs:
             echo
             echo "- Status: \`${{ job.status }}\`"
             echo "- UUID: \`${{ steps.submit.outputs.uuid || 'not captured' }}\`"
+            echo "- Mode: \`blocking\`"
             echo "- Branch: \`${SIFLOW_SOURCE_REF}\`"
             echo "- GitHub ref: \`${SIFLOW_GITHUB_REF}\`"
             echo "- Experiment: \`${SIFLOW_EXP_NAME:-not prepared}\`"
