@@ -1,49 +1,8 @@
 # Copyright (c) 2025, NVIDIA CORPORATION and Alibaba PAI. All rights reserved.
-import os
 from collections import defaultdict
-from contextlib import nullcontext
 from typing import Dict
 
 import torch
-
-# SparseRL-Sync integration: sparse_diff_context wraps the param.copy_() so the
-# attached SparseManager can snapshot pre-state, then diff against post-state to
-# build per-param sparse-update indices. The package is imported only when
-# SPARSERL_STATE explicitly enables SparseRL-Sync.
-_SPARSERL_DISABLED_STATES = {"", "0", "false", "none", "off", "disable", "disabled"}
-_SPARSERL_ENABLED_STATES = {
-    "observe",
-    "update",
-    "update_and_validate",
-    "update_and_observe",
-    "update_and_validate_and_observe",
-}
-
-
-def _sparserl_state_enabled():
-    value = os.getenv("SPARSERL_STATE", "").strip().lower()
-    if value in _SPARSERL_DISABLED_STATES:
-        return False
-    if value in _SPARSERL_ENABLED_STATES:
-        return True
-    expected = ", ".join(sorted(_SPARSERL_ENABLED_STATES))
-    raise RuntimeError(
-        f"Invalid SPARSERL_STATE={value!r}. Expected one of: {expected}; "
-        "unset, none, false, or off disables SparseRL-Sync."
-    )
-
-
-if _sparserl_state_enabled():
-    try:
-        from sparse_update import sparse_diff_context
-    except ImportError as exc:
-        raise RuntimeError(
-            "SPARSERL_STATE enables SparseRL-Sync, but sparse_update is not importable."
-        ) from exc
-else:
-
-    def sparse_diff_context(*args, **kwargs):
-        return nullcontext()
 
 
 def _param_generator(cpu_optimizer):
@@ -93,6 +52,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         pin_cpu_grads: bool = True,
         pin_cpu_params: bool = True,
         overlap_cpu_optimizer_d2h_h2d: bool = True,
+        shard_copy_context_func=None,
         **kwargs,
     ):
         super(HybridDeviceOptimizer, self).__init__(
@@ -117,6 +77,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.overlap_cpu_optimizer_d2h_h2d = overlap_cpu_optimizer_d2h_h2d
         self.param_update_in_fp32 = param_update_in_fp32
         self.sub_optimizer_kwargs = kwargs
+        # Optional copy-back context hook (e.g. sparse weight sync). None = the
+        # native bare copy; a callable wraps each in-place copy below.
+        self._shard_copy_context_func = shard_copy_context_func
 
         self._init_sub_optimizers()
         self._register_load_state_dict_hooks()
@@ -162,8 +125,11 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 with torch.cuda.stream(self._h2d_stream):
                     for param in _param_generator(optimizer):
                         gpu_param = self.cpu_copys_map_gpu_param[param]
-                        with sparse_diff_context(gpu_param, param):
+                        if self._shard_copy_context_func is None:
                             gpu_param.data.copy_(param.data, non_blocking=True)
+                        else:
+                            with self._shard_copy_context_func(gpu_param, param):
+                                gpu_param.data.copy_(param.data, non_blocking=True)
                 self._d2h_stream.record_event().wait(torch.cuda.current_stream())
 
             return param_copy_back_gpu_hook
@@ -179,8 +145,11 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
                         if param in self.param_to_fp32_param:
                             fp32_param = self.param_to_fp32_param[param]
-                            with sparse_diff_context(param, fp32_param):
+                            if self._shard_copy_context_func is None:
                                 param.data.copy_(fp32_param.data)
+                            else:
+                                with self._shard_copy_context_func(param, fp32_param):
+                                    param.data.copy_(fp32_param.data)
 
             return fp32_param_copy_back_gpu_hook
 

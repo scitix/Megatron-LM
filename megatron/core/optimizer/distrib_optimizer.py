@@ -4,9 +4,7 @@
 
 import gc
 import itertools
-import os
 from collections import ChainMap
-from contextlib import nullcontext
 from dataclasses import replace
 from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -53,48 +51,6 @@ from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
 from .optimizer_config import OptimizerConfig
-
-# SparseRL-Sync integration: init_sparse_manager binds the optimizer's shard
-# views to a SparseManager that tracks per-rollout dp-local diff indices.
-# sparse_diff_context wraps the in-place shard_model_param.copy_() that
-# realises the new training weights. The package is imported only when
-# SPARSERL_STATE explicitly enables SparseRL-Sync.
-_SPARSERL_DISABLED_STATES = {"", "0", "false", "none", "off", "disable", "disabled"}
-_SPARSERL_ENABLED_STATES = {
-    "observe",
-    "update",
-    "update_and_validate",
-    "update_and_observe",
-    "update_and_validate_and_observe",
-}
-
-
-def _sparserl_state_enabled():
-    value = os.getenv("SPARSERL_STATE", "").strip().lower()
-    if value in _SPARSERL_DISABLED_STATES:
-        return False
-    if value in _SPARSERL_ENABLED_STATES:
-        return True
-    expected = ", ".join(sorted(_SPARSERL_ENABLED_STATES))
-    raise RuntimeError(
-        f"Invalid SPARSERL_STATE={value!r}. Expected one of: {expected}; "
-        "unset, none, false, or off disables SparseRL-Sync."
-    )
-
-
-if _sparserl_state_enabled():
-    try:
-        from sparse_update import init_sparse_manager, sparse_diff_context
-    except ImportError as exc:
-        raise RuntimeError(
-            "SPARSERL_STATE enables SparseRL-Sync, but sparse_update is not importable."
-        ) from exc
-else:
-    def sparse_diff_context(*args, **kwargs):
-        return nullcontext()
-
-    def init_sparse_manager(*args, **kwargs):
-        return None
 
 logger = getLogger(__name__)
 
@@ -456,14 +412,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     shard_float16_params_this_group.append(shard_model_param)
                     shard_fp32_from_float16_params_this_group.append(shard_main_param)
 
-                    # SparseRL-Sync: bind the shard views to a SparseManager so
-                    # later sparse_diff_context() calls can recover the owner.
-                    init_sparse_manager(
-                        model_param=model_param,
-                        shard_model_weight=shard_model_param,
-                        shard_main_weight=shard_main_param,
-                        param_range=param_range,
-                    )
+                    # Optional shard-param bind hook (e.g. sparse weight sync):
+                    # lets a trainer bind the shard views so a later copy-back
+                    # context can recover the owning param. None = native path.
+                    if config.shard_param_bind_func is not None:
+                        config.shard_param_bind_func(
+                            model_param=model_param,
+                            shard_model_weight=shard_model_param,
+                            shard_main_weight=shard_main_param,
+                            param_range=param_range,
+                        )
 
                 # fp32 params.
                 elif model_param.type() == 'torch.cuda.FloatTensor':
@@ -476,14 +434,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     if hasattr(model_param, 'shared'):
                         shard_model_param.shared = model_param.shared
 
-                    # SparseRL-Sync: fp32 params share the same shard view for
-                    # both "model" and "main" sides; pass it on both slots.
-                    init_sparse_manager(
-                        model_param=model_param,
-                        shard_model_weight=shard_model_param,
-                        shard_main_weight=shard_model_param,
-                        param_range=param_range,
-                    )
+                    # fp32 params share the same shard view for both "model" and
+                    # "main" sides; pass it on both slots of the bind hook.
+                    if config.shard_param_bind_func is not None:
+                        config.shard_param_bind_func(
+                            model_param=model_param,
+                            shard_model_weight=shard_model_param,
+                            shard_main_weight=shard_model_param,
+                            param_range=param_range,
+                        )
 
                 else:
                     raise TypeError(
@@ -659,7 +618,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         if isinstance(self.optimizer, HybridDeviceOptimizer):
             self.optimizer = HybridDeviceOptimizer(
-                params=[g["orig_group"] for g in self.opt_group_ranges], **self.optimizer.defaults
+                params=[g["orig_group"] for g in self.opt_group_ranges],
+                shard_copy_context_func=config.shard_copy_context_func,
+                **self.optimizer.defaults,
             )
         else:
             self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
@@ -2518,11 +2479,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # FP8 params are quantized in the above "quantize_param_shard" function.
                         continue
                     else:
-                        # SparseRL-Sync: capture the pre/post state of the
-                        # shard copy so the per-param diff indices can be
-                        # computed by the manager.
-                        with sparse_diff_context(shard_model_param, shard_main_param):
+                        # Optional copy-back context (e.g. sparse weight sync):
+                        # wraps the in-place shard copy so a trainer can capture
+                        # its pre/post state. None = native bare copy.
+                        shard_copy_context_func = self.config.shard_copy_context_func
+                        if shard_copy_context_func is None:
                             shard_model_param.data.copy_(shard_main_param)
+                        else:
+                            with shard_copy_context_func(shard_model_param, shard_main_param):
+                                shard_model_param.data.copy_(shard_main_param)
 
         # Copy shard groups to model groups.
         copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups)
