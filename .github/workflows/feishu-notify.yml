@@ -1,0 +1,36 @@
+name: Issue Comment Notification
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  notify:
+    runs-on: [self-hosted, hisys-megatron-runner]
+    steps:
+      - name: Send Feishu notification
+        env:
+          # Untrusted GitHub event fields are passed through env, never
+          # interpolated into the shell script, to avoid command injection.
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_USER: ${{ github.event.comment.user.login }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${FEISHU_WEBHOOK_URL:-}" ]; then
+            echo "FEISHU_WEBHOOK_URL secret is not set; skipping notification." >&2
+            exit 0
+          fi
+
+          # Build the message body, then let jq JSON-encode it so any quotes
+          # or newlines in the comment are escaped safely.
+          MESSAGE=$(printf '**%s** received a new comment:\n\n%s: %s\n\nDetails: %s' \
+            "$ISSUE_TITLE" "$COMMENT_USER" "$COMMENT_BODY" "$ISSUE_URL")
+          PAYLOAD=$(jq -n --arg text "$MESSAGE" '{msg_type: "text", content: {text: $text}}')
+
+          curl -sSf -X POST "$FEISHU_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD"
