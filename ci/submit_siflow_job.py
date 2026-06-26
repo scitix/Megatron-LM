@@ -129,7 +129,7 @@ def parse_args():
     parser.add_argument(
         "--result-file-grace",
         type=int,
-        default=300,
+        default=1800,
         help="Seconds to wait for the shared result file after SiFlow reports task success.",
     )
     parser.add_argument(
@@ -229,6 +229,82 @@ def result_path_for(args):
     return Path(args.ci_root) / args.sha / "status" / "result.json"
 
 
+def markdown_cell(value):
+    text = "not set" if value is None or value == "" else str(value)
+    return text.replace("|", "\\|").replace("\n", " ")
+
+
+def markdown_code(value):
+    text = markdown_cell(value).replace("`", "'")
+    return f"`{text}`"
+
+
+def iter_test_specs(args):
+    if args.test_specs:
+        specs = [spec for spec in args.test_specs.split(";") if spec]
+    else:
+        specs = [f"{args.test_model}:{args.test_case}"]
+
+    for spec in specs:
+        parts = spec.split(":", 2)
+        test_model = parts[0] if len(parts) > 0 else ""
+        test_case = parts[1] if len(parts) > 1 else ""
+        training_script = parts[2] if len(parts) > 2 else args.training_script_path
+        yield test_model, test_case, training_script
+
+
+def write_github_summary(args, uuid, exit_code):
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_path:
+        return
+
+    result_path = result_path_for(args)
+    result = read_result_file(result_path) if result_path is not None else None
+    result_state = result.get("state") if result else "not visible"
+    result_exit_code = result.get("exit_code") if result else "not visible"
+    submitter_status = "success" if exit_code == 0 else f"failed ({exit_code})"
+
+    lines = [
+        "### SiFlow Workload",
+        "",
+        "| Field | Value |",
+        "| --- | --- |",
+        f"| Submitter status | {markdown_code(submitter_status)} |",
+        f"| SiFlow UUID | {markdown_code(uuid or 'not captured')} |",
+        f"| Mode | {markdown_code('blocking' if args.wait else 'submit-only')} |",
+        f"| Experiment | {markdown_code(args.exp_name)} |",
+        f"| Source branch | {markdown_code(args.ref)} |",
+        f"| GitHub ref | {markdown_code(args.github_ref)} |",
+        f"| Commit | {markdown_code(args.sha)} |",
+        f"| Nodes | {markdown_code(args.nodes)} |",
+        f"| Poll interval | {markdown_code(f'{args.poll_interval}s')} |",
+        f"| Wait timeout | {markdown_code(f'{args.wait_timeout}s')} |",
+        f"| Result file required | {markdown_code('yes' if args.require_result_file else 'no')} |",
+        f"| Result file | {markdown_code(result_path or 'not configured')} |",
+        f"| Result state | {markdown_code(result_state)} |",
+        f"| Result exit code | {markdown_code(result_exit_code)} |",
+        "",
+        "#### Golden Tests",
+        "",
+        "| Model | Test case | Training script |",
+        "| --- | --- | --- |",
+    ]
+    for test_model, test_case, training_script in iter_test_specs(args):
+        lines.append(
+            "| "
+            f"{markdown_code(test_model)} | "
+            f"{markdown_code(test_case)} | "
+            f"{markdown_code(training_script)} |"
+        )
+
+    try:
+        with open(summary_path, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+            f.write("\n")
+    except OSError as exc:
+        print(f"[summary] Failed to write GitHub step summary: {exc}", flush=True)
+
+
 def wait_for_task(client, uuid, args):
     result_path = result_path_for(args)
     deadline = time.monotonic() + args.wait_timeout
@@ -288,12 +364,14 @@ def wait_for_task(client, uuid, args):
             if success_without_result_since is None:
                 success_without_result_since = now
                 print(
-                    "[wait] SiFlow reports success; waiting for required CI result file.",
+                    "[wait] SiFlow reports success; waiting up to "
+                    f"{args.result_file_grace}s for required CI result file.",
                     flush=True,
                 )
             elif now - success_without_result_since >= args.result_file_grace:
                 print(
-                    "[wait] SiFlow task finished, but no final CI result file was written.",
+                    "[wait] SiFlow task finished, but no final CI result file was visible at "
+                    f"{result_path}.",
                     flush=True,
                 )
                 return 1
@@ -371,10 +449,14 @@ def submit_train(args):
 
 def main():
     args = parse_args()
-    client, uuid = submit_train(args)
-    if args.wait:
-        return wait_for_task(client, uuid, args)
-    return 0
+    uuid = None
+    exit_code = 1
+    try:
+        client, uuid = submit_train(args)
+        exit_code = wait_for_task(client, uuid, args) if args.wait else 0
+        return exit_code
+    finally:
+        write_github_summary(args, uuid, exit_code)
 
 
 if __name__ == "__main__":

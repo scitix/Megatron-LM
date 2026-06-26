@@ -1,12 +1,13 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-name: Submit SiFlow Workload
+name: Golden Value Check
 
 on:
   pull_request:
     branches:
       - ci-dev
+      - sirl-stable
   workflow_dispatch:
     inputs:
       submitter_path:
@@ -185,6 +186,7 @@ jobs:
       SIFLOW_ENABLE_LIGHTWEIGHT_MODE: ${{ inputs.enable_lightweight_mode || 'false' }}
       SIFLOW_POLL_INTERVAL: ${{ inputs.poll_interval || '60' }}
       SIFLOW_WAIT_TIMEOUT: ${{ inputs.wait_timeout || '21600' }}
+      SIFLOW_RESULT_FILE_GRACE: "1800"
       REPO_CLONE_TOKEN: ${{ secrets.REPO_CLONE_TOKEN }}
 
     steps:
@@ -266,6 +268,7 @@ jobs:
         run: |
           cat <<EOF
           Submitter:      ${SIFLOW_SUBMITTER_PATH}
+          Mode:           blocking
           Branch:         ${SIFLOW_SOURCE_REF}
           GitHub ref:     ${SIFLOW_GITHUB_REF}
           Experiment:     ${SIFLOW_EXP_NAME}
@@ -287,6 +290,7 @@ jobs:
           CI root:        ${SIFLOW_CI_ROOT}/${{ github.sha }}
           Wait timeout:   ${SIFLOW_WAIT_TIMEOUT}s
           Poll interval:  ${SIFLOW_POLL_INTERVAL}s
+          Result grace:   ${SIFLOW_RESULT_FILE_GRACE}s
           Command:        ${SIFLOW_CMD:-<submitter default>}
           Commit:         ${{ github.sha }}
           EOF
@@ -332,7 +336,9 @@ jobs:
             --enable-lightweight-mode "${SIFLOW_ENABLE_LIGHTWEIGHT_MODE}" \
             --wait \
             --poll-interval "${SIFLOW_POLL_INTERVAL}" \
-            --wait-timeout "${SIFLOW_WAIT_TIMEOUT}"
+            --wait-timeout "${SIFLOW_WAIT_TIMEOUT}" \
+            --result-file-grace "${SIFLOW_RESULT_FILE_GRACE}" \
+            --no-require-result-file
           )
 
           if [[ -n "${SIFLOW_CMD}" ]]; then
@@ -350,22 +356,3 @@ jobs:
           fi
 
           exit "${submit_exit}"
-
-      - name: Summary
-        if: always()
-        shell: bash
-        run: |
-          {
-            echo "### SiFlow submission"
-            echo
-            echo "- Status: \`${{ job.status }}\`"
-            echo "- UUID: \`${{ steps.submit.outputs.uuid || 'not captured' }}\`"
-            echo "- Branch: \`${SIFLOW_SOURCE_REF}\`"
-            echo "- GitHub ref: \`${SIFLOW_GITHUB_REF}\`"
-            echo "- Experiment: \`${SIFLOW_EXP_NAME:-not prepared}\`"
-            echo "- Nodes: \`${SIFLOW_NODES}\`"
-            echo "- Test specs: \`${SIFLOW_TEST_SPECS:-${SIFLOW_TEST_MODEL}/${SIFLOW_TEST_CASE}}\`"
-            echo "- Wait timeout: \`${SIFLOW_WAIT_TIMEOUT}s\`"
-            echo "- Poll interval: \`${SIFLOW_POLL_INTERVAL}s\`"
-            echo "- Commit: \`${{ github.sha }}\`"
-          } >> "$GITHUB_STEP_SUMMARY"
