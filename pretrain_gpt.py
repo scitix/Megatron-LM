@@ -2,6 +2,7 @@
 
 """Pretrain and SFT GPT."""
 
+raise
 from functools import partial
 from typing import List, Optional, Tuple
 
