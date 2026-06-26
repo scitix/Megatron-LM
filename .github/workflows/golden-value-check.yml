@@ -196,9 +196,9 @@ jobs:
           set -euo pipefail
           branch="${SIFLOW_SOURCE_REF}"
           case "${branch}" in
-            ci/*) ;;
+            bugfix/*|ci/*|feat/*|hotfix/*|ci-dev) ;;
             *)
-              echo "This workflow only submits from ci/* branches. Selected branch: ${branch}"
+              echo "This workflow only submits from bugfix/*, ci/*, feat/*, hotfix/*, or ci-dev. Selected branch: ${branch}"
               exit 1
               ;;
           esac
