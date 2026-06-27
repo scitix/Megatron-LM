@@ -236,3 +236,20 @@ class TestExpertStatsDistributed:
         r.train()
         r.routing(logits())
         assert "tokens_per_expert" not in torch._expert_stats_tracker
+
+
+def test_render_heatmap_image_returns_array_or_path():
+    """render_heatmap_image renders a non-None image for a valid MoE snapshot."""
+    import numpy as np
+    snap = {
+        "tokens": np.array([[10.0, 30.0, 5.0, 55.0]], dtype=np.float32),
+        "weights": np.array([[0.1, 0.3, 0.05, 0.55]], dtype=np.float32),
+        "num_layers": 1,
+        "num_experts": 4,
+    }
+    img = es.render_heatmap_image(snap, step=5)
+    assert img is not None  # matplotlib present in CI
+    # all-zero (no MoE layer) -> None
+    snap_zero = {"tokens": np.zeros((1, 4), np.float32), "weights": np.zeros((1, 4), np.float32),
+                 "num_layers": 1, "num_experts": 4}
+    assert es.render_heatmap_image(snap_zero) is None

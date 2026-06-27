@@ -426,6 +426,29 @@ def _save_heatmap_png(img_data, directory: str, filename: str) -> None:
         print(f"[expert_stats] failed to save heatmap {filepath}: {e}", file=sys.stderr)
 
 
+def render_heatmap_image(snapshot: dict, step: int = 0):
+    """Render the MoE-layer token-count heatmap to an RGB uint8 array (or None).
+
+    Synchronous helper for trainers that log the heatmap into their OWN sink
+    (e.g. ``swanlab.Image(render_heatmap_image(snap))``) — the megatron module
+    owns rendering, the trainer owns the sink. The async local-PNG path is
+    :func:`render_and_dump`. Returns ``None`` if matplotlib is unavailable or
+    there are no MoE layers. The return may be a numpy RGB array or, in the
+    PIL-less fallback, a PNG file path — both accepted by ``swanlab.Image``.
+    """
+    if snapshot is None:
+        return None
+    tokens = snapshot["tokens"]
+    moe_idx = _moe_layer_indices(tokens)
+    if not moe_idx:
+        return None
+    return _render_heatmap(
+        tokens[moe_idx],
+        title=f"Expert Token Count (step {step})",
+        ylabel=f"MoE Layer (0-{len(moe_idx) - 1})",
+    )
+
+
 def render_and_dump(snapshot: dict, step: int, *, heatmap: bool, jsonl: bool = True) -> None:
     """Async: render a local heatmap PNG (if ``heatmap``) + append JSONL (if ``jsonl``).
 
