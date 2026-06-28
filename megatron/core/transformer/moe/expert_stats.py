@@ -358,54 +358,66 @@ def _render_heatmap(data: np.ndarray, title: str, xlabel: str = "Expert", ylabel
     Returns ``None`` (warn) if matplotlib is unavailable — matplotlib is NOT a hard
     Megatron dependency. Both trainers ship it, so this never misses in practice.
     """
+    # Some runtimes (slime/sglang) ship a stubbed `IPython` module that lacks the
+    # attributes matplotlib's interactive-framework probe reads (`get_ipython`,
+    # `version_info`, ... — which one varies by matplotlib version), raising
+    # AttributeError mid-render. Force the non-interactive Agg backend AND hide
+    # IPython from sys.modules for the whole render so matplotlib never probes
+    # it; restore it afterward. This is a no-op on trainers with a real IPython.
+    os.environ.setdefault("MPLBACKEND", "Agg")
+    _saved_ipython = sys.modules.pop("IPython", None)
     try:
-        import matplotlib
+        try:
+            import matplotlib
 
-        matplotlib.use("Agg")
-        import io
+            matplotlib.use("Agg")
+            import io
 
-        import matplotlib.pyplot as plt
-        from matplotlib.colors import LogNorm
-    except Exception:
-        print("[expert_stats] matplotlib unavailable; skipping heatmap", file=sys.stderr)
-        return None
+            import matplotlib.pyplot as plt
+            from matplotlib.colors import LogNorm
+        except Exception as e:
+            print(f"[expert_stats] matplotlib unavailable; skipping heatmap: {e}", file=sys.stderr)
+            return None
 
-    num_layers, num_experts = data.shape
-    fig, ax = plt.subplots(1, 1, figsize=(20, 10), dpi=100)
+        num_layers, num_experts = data.shape
+        fig, ax = plt.subplots(1, 1, figsize=(20, 10), dpi=100)
 
-    vmin = data[data > 0].min() if (data > 0).any() else 1.0
-    vmax = data.max()
-    norm = LogNorm(vmin=max(vmin, 1.0), vmax=max(vmax, 1.0)) if vmax / max(vmin, 1e-10) > 100 else None
+        vmin = data[data > 0].min() if (data > 0).any() else 1.0
+        vmax = data.max()
+        norm = LogNorm(vmin=max(vmin, 1.0), vmax=max(vmax, 1.0)) if vmax / max(vmin, 1e-10) > 100 else None
 
-    im = ax.imshow(data, aspect="auto", cmap="YlOrRd", norm=norm, interpolation="nearest")
-    ax.set_title(title, fontsize=14, fontweight="bold")
-    ax.set_xlabel(xlabel, fontsize=11)
-    ax.set_ylabel(ylabel, fontsize=11)
-    ystep = max(1, num_layers // 12)
-    ax.set_yticks(range(0, num_layers, ystep))
-    ax.set_yticklabels([str(i) for i in range(0, num_layers, ystep)])
-    xstep = max(1, num_experts // 12)
-    ax.set_xticks(range(0, num_experts, xstep))
-    ax.set_xticklabels([str(i) for i in range(0, num_experts, xstep)])
-    fig.colorbar(im, ax=ax, shrink=0.8)
-    fig.tight_layout()
+        im = ax.imshow(data, aspect="auto", cmap="YlOrRd", norm=norm, interpolation="nearest")
+        ax.set_title(title, fontsize=14, fontweight="bold")
+        ax.set_xlabel(xlabel, fontsize=11)
+        ax.set_ylabel(ylabel, fontsize=11)
+        ystep = max(1, num_layers // 12)
+        ax.set_yticks(range(0, num_layers, ystep))
+        ax.set_yticklabels([str(i) for i in range(0, num_layers, ystep)])
+        xstep = max(1, num_experts // 12)
+        ax.set_xticks(range(0, num_experts, xstep))
+        ax.set_xticklabels([str(i) for i in range(0, num_experts, xstep)])
+        fig.colorbar(im, ax=ax, shrink=0.8)
+        fig.tight_layout()
 
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
-    buf.seek(0)
-    plt.close(fig)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+        buf.seek(0)
+        plt.close(fig)
 
-    try:
-        from PIL import Image as PILImage
+        try:
+            from PIL import Image as PILImage
 
-        return np.array(PILImage.open(buf).convert("RGB"), dtype=np.uint8)
-    except Exception:
-        import tempfile
+            return np.array(PILImage.open(buf).convert("RGB"), dtype=np.uint8)
+        except Exception:
+            import tempfile
 
-        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-        tmp.write(buf.getvalue())
-        tmp.close()
-        return tmp.name  # file path fallback
+            tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            tmp.write(buf.getvalue())
+            tmp.close()
+            return tmp.name  # file path fallback
+    finally:
+        if _saved_ipython is not None:
+            sys.modules["IPython"] = _saved_ipython
 
 
 def _save_heatmap_png(img_data, directory: str, filename: str) -> None:
