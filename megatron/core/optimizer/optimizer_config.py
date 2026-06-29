@@ -214,6 +214,21 @@ class OptimizerConfig:
     timers: Optional[Callable] = None
     """Function to get timers."""
 
+    shard_param_bind_func: Optional[Callable] = None
+    """Optional callable invoked once per shard while the distributed optimizer
+    builds its model/main param groups, with keyword args ``model_param``,
+    ``shard_model_weight``, ``shard_main_weight``, and ``param_range``. Lets a
+    trainer bind shard views to an external manager so a later copy-back context
+    can recover the owning param. ``None`` (default) skips the call entirely —
+    native Megatron behavior."""
+
+    shard_copy_func: Optional[Callable] = None
+    """Optional callable ``(shard_model_param, shard_main_param) -> context
+    manager`` that wraps every in-place shard copy-back
+    ``shard_model_param.copy_(shard_main_param)`` in the distributed optimizer,
+    letting a trainer capture the copy's pre/post state. ``None`` (default) skips
+    the wrapper and runs the native bare copy — native Megatron behavior."""
+
     config_logger_dir: str = ""
     """When non-empty, dumps entry-point configs to config_logger_dir"""
 

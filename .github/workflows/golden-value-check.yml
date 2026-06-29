@@ -152,7 +152,7 @@ concurrency:
 
 jobs:
   submit:
-    name: Submit workload
+    name: Golden Value Check
     runs-on: [self-hosted, linux]
     timeout-minutes: 420
 

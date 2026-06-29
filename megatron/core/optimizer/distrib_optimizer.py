@@ -413,6 +413,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     shard_float16_params_this_group.append(shard_model_param)
                     shard_fp32_from_float16_params_this_group.append(shard_main_param)
 
+                    # Optional shard-param bind hook (e.g. sparse weight sync):
+                    # lets a trainer bind the shard views so a later copy-back
+                    # context can recover the owning param. None = native path.
+                    if config.shard_param_bind_func is not None:
+                        config.shard_param_bind_func(
+                            model_param=model_param,
+                            shard_model_weight=shard_model_param,
+                            shard_main_weight=shard_main_param,
+                            param_range=param_range,
+                        )
+
                 # fp32 params.
                 elif model_param.type() == 'torch.cuda.FloatTensor':
                     shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
@@ -423,6 +434,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     )
                     if hasattr(model_param, 'shared'):
                         shard_model_param.shared = model_param.shared
+
+                    # fp32 params share the same shard view for both "model" and
+                    # "main" sides; pass it on both slots of the bind hook.
+                    if config.shard_param_bind_func is not None:
+                        config.shard_param_bind_func(
+                            model_param=model_param,
+                            shard_model_weight=shard_model_param,
+                            shard_main_weight=shard_model_param,
+                            param_range=param_range,
+                        )
 
                 else:
                     raise TypeError(
@@ -598,7 +619,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         if isinstance(self.optimizer, HybridDeviceOptimizer):
             self.optimizer = HybridDeviceOptimizer(
-                params=[g["orig_group"] for g in self.opt_group_ranges], **self.optimizer.defaults
+                params=[g["orig_group"] for g in self.opt_group_ranges],
+                shard_copy_func=config.shard_copy_func,
+                **self.optimizer.defaults,
             )
         else:
             self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
@@ -2457,7 +2480,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # FP8 params are quantized in the above "quantize_param_shard" function.
                         continue
                     else:
-                        shard_model_param.data.copy_(shard_main_param)
+                        # Optional copy-back context (e.g. sparse weight sync):
+                        # wraps the in-place shard copy so a trainer can capture
+                        # its pre/post state. None = native bare copy.
+                        shard_copy_func = self.config.shard_copy_func
+                        if shard_copy_func is None:
+                            shard_model_param.data.copy_(shard_main_param)
+                        else:
+                            with shard_copy_func(shard_model_param, shard_main_param):
+                                shard_model_param.data.copy_(shard_main_param)
 
         # Copy shard groups to model groups.
         copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups)
