@@ -442,6 +442,13 @@ def validate_args(args, defaults={}):
             assert args.seq_length <= args.rl_sequence_packing_bin_size, \
                 f"rl_sequence_packing_bin_size should be larger than or equal to seq_length"
 
+    # SparseRL-Sync distributed weight sync reads shard slices through the
+    # distributed optimizer's main-param groups, so it cannot run on the
+    # non-distributed optimizer path.
+    if args.sparserl_state is not None:
+        assert args.use_distributed_optimizer, \
+            'SparseRL-Sync (--sparserl-state) requires --use-distributed-optimizer.'
+
     if args.rank == 0:
         print('using world size: {}, data-parallel size: {}, '
               'context-parallel size: {}, '
@@ -2129,6 +2136,13 @@ def _add_rl_args(parser):
                        help='Algorithm for distributing packed bins across ranks. '
                             'fifo: first-in-first-out sequential distribution, '
                             'round-robin: distribute bins cyclically across ranks for better load balancing')
+    group.add_argument('--sparserl-state', type=str, default=None,
+                       choices=['observe', 'update', 'update_and_validate',
+                                'update_and_observe', 'update_and_validate_and_observe'],
+                       help='Enable SparseRL-Sync distributed weight sync and select its mode. '
+                            'Default (unset) runs the native dense weight-sync path. The trainer '
+                            'binds the distributed-optimizer shard hooks and drives the '
+                            'sparse_update package from this value.')
     return parser
 
 def _add_training_args(parser):
