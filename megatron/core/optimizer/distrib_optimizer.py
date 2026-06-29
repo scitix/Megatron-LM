@@ -2,6 +2,7 @@
 
 """Megatron distributed optimizer."""
 
+
 import gc
 import itertools
 from collections import ChainMap
@@ -619,7 +620,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if isinstance(self.optimizer, HybridDeviceOptimizer):
             self.optimizer = HybridDeviceOptimizer(
                 params=[g["orig_group"] for g in self.opt_group_ranges],
-                shard_copy_context_func=config.shard_copy_context_func,
+                shard_copy_func=config.shard_copy_func,
                 **self.optimizer.defaults,
             )
         else:
@@ -2482,11 +2483,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # Optional copy-back context (e.g. sparse weight sync):
                         # wraps the in-place shard copy so a trainer can capture
                         # its pre/post state. None = native bare copy.
-                        shard_copy_context_func = self.config.shard_copy_context_func
-                        if shard_copy_context_func is None:
+                        shard_copy_func = self.config.shard_copy_func
+                        if shard_copy_func is None:
                             shard_model_param.data.copy_(shard_main_param)
                         else:
-                            with shard_copy_context_func(shard_model_param, shard_main_param):
+                            with shard_copy_func(shard_model_param, shard_main_param):
                                 shard_model_param.data.copy_(shard_main_param)
 
         # Copy shard groups to model groups.

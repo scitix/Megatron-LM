@@ -52,7 +52,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         pin_cpu_grads: bool = True,
         pin_cpu_params: bool = True,
         overlap_cpu_optimizer_d2h_h2d: bool = True,
-        shard_copy_context_func=None,
+        shard_copy_func=None,
         **kwargs,
     ):
         super(HybridDeviceOptimizer, self).__init__(
@@ -79,7 +79,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.sub_optimizer_kwargs = kwargs
         # Optional copy-back context hook (e.g. sparse weight sync). None = the
         # native bare copy; a callable wraps each in-place copy below.
-        self._shard_copy_context_func = shard_copy_context_func
+        self._shard_copy_func = shard_copy_func
 
         self._init_sub_optimizers()
         self._register_load_state_dict_hooks()
@@ -125,10 +125,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 with torch.cuda.stream(self._h2d_stream):
                     for param in _param_generator(optimizer):
                         gpu_param = self.cpu_copys_map_gpu_param[param]
-                        if self._shard_copy_context_func is None:
+                        if self._shard_copy_func is None:
                             gpu_param.data.copy_(param.data, non_blocking=True)
                         else:
-                            with self._shard_copy_context_func(gpu_param, param):
+                            with self._shard_copy_func(gpu_param, param):
                                 gpu_param.data.copy_(param.data, non_blocking=True)
                 self._d2h_stream.record_event().wait(torch.cuda.current_stream())
 
@@ -145,10 +145,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
                         if param in self.param_to_fp32_param:
                             fp32_param = self.param_to_fp32_param[param]
-                            if self._shard_copy_context_func is None:
+                            if self._shard_copy_func is None:
                                 param.data.copy_(fp32_param.data)
                             else:
-                                with self._shard_copy_context_func(param, fp32_param):
+                                with self._shard_copy_func(param, fp32_param):
                                     param.data.copy_(fp32_param.data)
 
             return fp32_param_copy_back_gpu_hook

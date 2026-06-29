@@ -222,7 +222,7 @@ class OptimizerConfig:
     can recover the owning param. ``None`` (default) skips the call entirely —
     native Megatron behavior."""
 
-    shard_copy_context_func: Optional[Callable] = None
+    shard_copy_func: Optional[Callable] = None
     """Optional callable ``(shard_model_param, shard_main_param) -> context
     manager`` that wraps every in-place shard copy-back
     ``shard_model_param.copy_(shard_main_param)`` in the distributed optimizer,
