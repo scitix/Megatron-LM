@@ -1,0 +1,322 @@
+name: Feishu sirl-stable Notifications
+
+# 把本 fork 里【与 sirl-stable 相关】的 PR / review / 行内评论 / push / tag 生命周期事件,
+# 统一推送到飞书机器人(交互卡片)。本文件是 slime-trainer 同名 bot 的 vendor 版:
+# 只关心 sirl-stable(团队的稳定集成分支),不理会 upstream 同步、sirl-dev 及其他分支的噪声。
+#
+# 交付分支须知(GitHub Actions 按事件用不同分支上的 workflow 文件):
+#  - push / pull_request                -> 用【被推分支 / PR base 分支】上的文件
+#  - pull_request_review(_comment)       -> 属 pull_request 家族,用【base 分支】上的文件
+#  - create(tag) 等非分支绑定事件         -> 用【默认分支】上的文件
+#  因此本文件必须存在于 sirl-stable 分支:
+#    * Megatron-LM 默认分支就是 sirl-stable -> 上述全部事件(含 tag)都会送达。
+#    * sglang 默认分支是 main              -> push / PR / review 会送达(取 base=sirl-stable 上的本文件);
+#      create(tag) 需默认分支上有本文件才送达,故在 sglang 上暂不会触发。
+#      刻意不把本文件放到 sglang 的 main:main 会被 OSS 官方同步周期性 replace,放上去会被冲掉/冲突。
+#
+# 设计要点(沿用 slime-trainer bot 的加固约定):
+#  - 注入安全:所有不可信字段(标题/正文/评论/分支名/用户名)只经 env 传入,再用 python3 json.dumps
+#    当作字面量数据进卡片,绝不拼进 run: 脚本或 ${{ }}。
+#  - 最小权限:permissions:{} 清空 GITHUB_TOKEN(本 workflow 全程只 curl webhook,从不 checkout、
+#    从不调用 gh/git/token)。@ 提醒所需的 open_id 映射内联在下方 env,不读文件、不需 token。
+#  - 运行环境:ubuntu-latest(纯公网 curl 到 open.feishu.cn,无需自托管 runner;本仓 CI 已在用 GitHub 托管 runner)。
+#  - 来自 fork 的 PR / review / 行内评论拿不到 secrets(GitHub 限制),由 job 级 if 跳过。
+#  - 缺 FEISHU_WEBHOOK_URL 时优雅 no-op:便于先落地 workflow,再由管理员配置 secret(repo 或 org 级)。
+#  - 降噪:省略 synchronize(每次推送刷屏)、labeled/edited 等抖动;push 到 sirl-stable 若是 PR 合并/squash
+#    (已有 PR 卡覆盖)则自动跳过,只保留直推/强推等高信号——sirl-stable 上的直推/强推尤其值得警觉。
+#
+# 通知类 workflow 无需 concurrency:每条事件都是独立的、值得送达的提醒。
+
+on:
+  push:
+    branches: [sirl-stable]
+  pull_request:
+    types: [opened, reopened, closed, ready_for_review, converted_to_draft, review_requested, assigned]
+  pull_request_review:
+    types: [submitted, dismissed]
+  pull_request_review_comment:
+    types: [created]
+  create:        # 分支/标签创建;下方 if 仅放行 ref_type == 'tag'(sirl-stable 稳定源 tag 是 slime-trainer 的 pin 依据)
+
+permissions: {}
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    # 仅放行 sirl-stable 相关事件:push(on: 已限定 sirl-stable)/ tag / base==sirl-stable 且非 fork 的 PR 家族
+    if: >-
+      ${{
+        github.event_name == 'push'
+        || (github.event_name == 'create' && github.event.ref_type == 'tag')
+        || (github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'sirl-stable' && github.event.pull_request.head.repo.full_name == github.repository)
+        || (github.event_name == 'pull_request_review' && github.event.pull_request.base.ref == 'sirl-stable' && github.event.pull_request.head.repo.full_name == github.repository)
+        || (github.event_name == 'pull_request_review_comment' && github.event.pull_request.base.ref == 'sirl-stable' && github.event.pull_request.head.repo.full_name == github.repository)
+      }}
+    steps:
+      - name: Send Feishu notification
+        env:
+          # 显式锁定 UTF-8 locale:否则下面按字符截断正文时可能退化成按字节、切坏中文
+          LANG: C.UTF-8
+          LC_ALL: C.UTF-8
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          # GitHub 用户名 -> 飞书 open_id 映射。命中则在卡片里 @ 对方(需机器人所在群有此人),
+          # 未命中自动降级为纯文本用户名。留空 {} 即关闭 @ 功能。
+          # 纯 webhook 机器人只能用 open_id(不支持 user_id/email),open_id 需自建应用获取。
+          # 例(一行写法):FEISHU_OPENID_MAP: '{"flowerfox-scitix":"ou_xxx","ilsa001":"ou_yyy"}'
+          FEISHU_OPENID_MAP: '{}'
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          REPO_FULL: ${{ github.repository }}
+          REPO_URL: ${{ github.event.repository.html_url }}
+          SENDER: ${{ github.event.sender.login }}
+          # comment 字段(pull_request_review_comment,行内 diff 评论)
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_URL: ${{ github.event.comment.html_url }}
+          COMMENT_USER: ${{ github.event.comment.user.login }}
+          RC_PATH: ${{ github.event.comment.path }}
+          # pull_request 字段
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_USER: ${{ github.event.pull_request.user.login }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
+          PR_HEAD: ${{ github.event.pull_request.head.ref }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          PR_ASSIGNEES: ${{ join(github.event.pull_request.assignees.*.login, ', ') }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ', ') }}
+          PR_ADDITIONS: ${{ github.event.pull_request.additions }}
+          PR_DELETIONS: ${{ github.event.pull_request.deletions }}
+          PR_CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          REQUESTED_REVIEWER: ${{ github.event.requested_reviewer.login }}
+          REQUESTED_TEAM: ${{ github.event.requested_team.name }}
+          # review 字段(pull_request_review 总结)
+          REVIEW_STATE: ${{ github.event.review.state }}
+          REVIEW_URL: ${{ github.event.review.html_url }}
+          REVIEW_USER: ${{ github.event.review.user.login }}
+          # push 字段(仅 sirl-stable)
+          PUSH_REF: ${{ github.event.ref }}
+          PUSH_FORCED: ${{ github.event.forced }}
+          PUSH_COMPARE: ${{ github.event.compare }}
+          PUSH_HEAD_MSG: ${{ github.event.head_commit.message }}
+          # create 字段(tag)
+          CREATE_REF: ${{ github.event.ref }}
+          CREATE_REF_TYPE: ${{ github.event.ref_type }}
+          # 卡片脚注时间(取本次事件最贴切的时间戳;create/tag 无时间则脚注省略)
+          TS_RAW: ${{ github.event.comment.created_at || github.event.review.submitted_at || github.event.head_commit.timestamp || github.event.pull_request.updated_at }}
+          # 卡片 JSON 构造程序(用 python3 而非 jq:GitHub 托管 runner 保证有 python3;
+          # json.dumps 负责所有转义,所有不可信字段只经 env 传入,绝不拼进脚本 -> 注入安全)
+          CARD_PY: |
+            import json, os
+
+            def e(k):
+                return os.environ.get(k, "")
+
+            try:
+                openid = json.loads(e("FEISHU_OPENID_MAP") or "{}")
+            except Exception:
+                openid = {}
+
+            def at(login):
+                if not login:
+                    return ""
+                oid = openid.get(login, "")
+                return "<at id=%s></at>" % oid if oid else login
+
+            def atlist(csv):
+                return ", ".join(at(x) for x in csv.split(", ")) if csv else ""
+
+            def field(name, val):
+                return {"is_short": True, "text": {"tag": "lark_md", "content": "**%s**\n%s" % (name, val)}}
+
+            author, sender = e("AUTHOR"), e("SENDER")
+            fields = [field("Repository", e("REPO_FULL")), field("Author", at(author))]
+            # Actor 仅在与 Author 不同(如他人关闭/合并)时显示
+            if sender and sender != author:
+                fields.append(field("Actor", at(sender)))
+            if e("REVIEWER"):
+                fields.append(field("Reviewer", atlist(e("REVIEWER"))))
+            if e("BRANCHES"):
+                fields.append(field("Branch", e("BRANCHES")))
+            if e("CHANGES"):
+                fields.append(field("Changes", e("CHANGES")))
+            if e("ASSIGNEES"):
+                fields.append(field("Assignees", atlist(e("ASSIGNEES"))))
+            if e("WORKFLOW"):
+                fields.append(field("Workflow", e("WORKFLOW")))
+            if e("FILE"):
+                fields.append(field("File", e("FILE")))
+            if e("LABELS"):
+                fields.append(field("Labels", e("LABELS")))
+
+            elements = [
+                {"tag": "div", "text": {"tag": "lark_md", "content": "**Title**\n" + e("TITLE")}},
+                {"tag": "div", "fields": fields},
+            ]
+            # Comment / Description 用 blockquote 与其他文字区分
+            if e("COMMENT"):
+                elements.append({"tag": "div", "text": {"tag": "lark_md", "content": "**Comment**\n> " + e("COMMENT")}})
+            if e("BODY"):
+                elements.append({"tag": "div", "text": {"tag": "lark_md", "content": "**Description**\n> " + e("BODY")}})
+            elements += [
+                {"tag": "hr"},
+                {"tag": "action", "actions": [
+                    {"tag": "button", "text": {"tag": "plain_text", "content": e("BTN")}, "url": e("URL"), "type": "primary"},
+                    {"tag": "button", "text": {"tag": "plain_text", "content": "View Repository"}, "url": e("REPO_URL"), "type": "default"},
+                ]},
+            ]
+            # note 脚注给时间
+            if e("TS"):
+                elements.append({"tag": "note", "elements": [{"tag": "lark_md", "content": "🕐 " + e("TS")}]})
+
+            card = {
+                "msg_type": "interactive",
+                "card": {
+                    "config": {"wide_screen_mode": True},
+                    "header": {"template": e("COLOR"), "title": {"tag": "plain_text", "content": e("HEADER")}},
+                    "elements": elements,
+                },
+            }
+            print(json.dumps(card, ensure_ascii=False))
+        run: |
+          set -euo pipefail
+
+          if [ -z "${FEISHU_WEBHOOK_URL:-}" ]; then
+            echo "FEISHU_WEBHOOK_URL 未配置,跳过通知(workflow 已就绪,待管理员配置 secret)。"
+            exit 0
+          fi
+
+          # ---- 卡片通用变量(按事件填充;空字段在卡片里自动省略)----
+          KIND=""; TITLE=""; NUMBER=""; URL=""; AUTHOR=""; STATE=""
+          BRANCHES=""; COMMENT=""; LABELS=""; ASSIGNEES=""; REVIEWER=""
+          CHANGES=""; BODY=""; FILE=""; WORKFLOW=""
+
+          # 去换行 + 截到 $2 字符(C.UTF-8 下按字符计)+ 超长补省略号
+          clip() {
+            local t="${1//$'\n'/ }"
+            if [ "${#t}" -gt "$2" ]; then printf '%s…' "${t:0:$2}"; else printf '%s' "$t"; fi
+          }
+
+          # ===== 1) 事件 -> 语义字段 =====
+          case "$EVENT" in
+            pull_request_review_comment)
+              # 行内 diff 评论:主角是评论人,带文件路径
+              KIND="PR"; TITLE="$PR_TITLE"; NUMBER="$PR_NUMBER"; URL="$COMMENT_URL"; AUTHOR="$COMMENT_USER"
+              STATE="review:inline"; BRANCHES="$PR_HEAD → $PR_BASE"; LABELS="$PR_LABELS"
+              COMMENT="$(clip "$COMMENT_BODY" 120)"; FILE="$RC_PATH"
+              ;;
+            pull_request_review)
+              # review 总结:主角是 reviewer
+              KIND="PR"; TITLE="$PR_TITLE"; NUMBER="$PR_NUMBER"; URL="$REVIEW_URL"; AUTHOR="$REVIEW_USER"
+              BRANCHES="$PR_HEAD → $PR_BASE"; LABELS="$PR_LABELS"
+              if [ "$ACTION" = "dismissed" ]; then STATE="review:dismissed"; else STATE="review:$REVIEW_STATE"; fi
+              ;;
+            pull_request)
+              KIND="PR"; TITLE="$PR_TITLE"; NUMBER="$PR_NUMBER"; URL="$PR_URL"; AUTHOR="$PR_USER"
+              BRANCHES="$PR_HEAD → $PR_BASE"; LABELS="$PR_LABELS"
+              case "$ACTION" in
+                closed)
+                  if [ "$PR_MERGED" = "true" ]; then STATE="merged"; else STATE="closed"; fi ;;
+                ready_for_review)   STATE="ready" ;;
+                converted_to_draft) STATE="draft" ;;
+                assigned)           STATE="assigned"; ASSIGNEES="$PR_ASSIGNEES" ;;
+                review_requested)
+                  STATE="review_requested"
+                  if   [ -n "$REQUESTED_REVIEWER" ]; then REVIEWER="$REQUESTED_REVIEWER"
+                  elif [ -n "$REQUESTED_TEAM" ];     then REVIEWER="@team $REQUESTED_TEAM"; fi
+                  ;;
+                opened)
+                  if [ "$PR_DRAFT" = "true" ]; then STATE="draft_opened"; else STATE="opened"; fi
+                  BODY="$(clip "$PR_BODY" 160)" ;;
+                reopened) STATE="reopened"; BODY="$(clip "$PR_BODY" 160)" ;;
+                *)        STATE="$ACTION" ;;
+              esac
+              # PR 体量仅在 open/merge/ready 时有意义,其余动作隐藏更干净
+              case "$STATE" in
+                opened|draft_opened|merged|ready)
+                  CHANGES="+${PR_ADDITIONS} −${PR_DELETIONS} · ${PR_CHANGED_FILES} files" ;;
+              esac
+              ;;
+            push)
+              KIND="Push"; AUTHOR="$SENDER"; URL="$PUSH_COMPARE"
+              BRANCHES="${PUSH_REF#refs/heads/}"
+              TITLE="$(clip "$PUSH_HEAD_MSG" 120)"
+              if [ "$PUSH_FORCED" = "true" ]; then
+                STATE="force_push"
+              else
+                STATE="push"
+                # 普通 push 到 sirl-stable 多半是 PR 合并/squash(已由 PR 卡覆盖)-> 去重跳过
+                if printf '%s' "$PUSH_HEAD_MSG" | grep -qE '\(#[0-9]+\)|^Merge (pull request|branch|remote-tracking)'; then
+                  echo "push 看似 PR 合并(已由 PR 卡覆盖),跳过。"
+                  exit 0
+                fi
+              fi
+              ;;
+            create)
+              [ "$CREATE_REF_TYPE" = "tag" ] || { echo "非 tag create,跳过。"; exit 0; }
+              KIND="Tag"; AUTHOR="$SENDER"; TITLE="$CREATE_REF"; STATE="tag_created"
+              URL="${REPO_URL}/releases/tag/${CREATE_REF}"
+              ;;
+            *)
+              echo "未处理的事件类型: $EVENT,跳过。"
+              exit 0
+              ;;
+          esac
+
+          # ===== 2) 状态 -> emoji + Header 颜色 + 展示文案 =====
+          case "$STATE" in
+            opened)                    EMOJI="🟢"; COLOR="blue";      STATE="Opened" ;;
+            draft_opened)              EMOJI="📝"; COLOR="grey";      STATE="Draft Opened" ;;
+            reopened)                  EMOJI="🔄"; COLOR="orange";    STATE="Reopened" ;;
+            merged)                    EMOJI="✅"; COLOR="green";     STATE="Merged" ;;
+            closed)                    EMOJI="❌"; COLOR="red";       STATE="Closed" ;;
+            ready)                     EMOJI="🚀"; COLOR="blue";      STATE="Ready for Review" ;;
+            draft)                     EMOJI="📝"; COLOR="grey";      STATE="Marked Draft" ;;
+            assigned)                  EMOJI="📌"; COLOR="turquoise"; STATE="Assigned" ;;
+            review_requested)          EMOJI="👀"; COLOR="wathet";    STATE="Review Requested" ;;
+            review:inline)             EMOJI="💬"; COLOR="grey";      STATE="Line Comment" ;;
+            review:approved)           EMOJI="⭐"; COLOR="green";     STATE="Approved" ;;
+            review:changes_requested)  EMOJI="❗"; COLOR="red";       STATE="Changes Requested" ;;
+            review:commented)          EMOJI="💬"; COLOR="grey";      STATE="Commented" ;;
+            review:dismissed)          EMOJI="🚫"; COLOR="grey";      STATE="Dismissed" ;;
+            review:*)                  EMOJI="💬"; COLOR="grey";      STATE="Reviewed" ;;
+            push)                      EMOJI="📥"; COLOR="wathet";    STATE="Pushed" ;;
+            force_push)                EMOJI="⚠️"; COLOR="red";       STATE="Force-pushed" ;;
+            tag_created)               EMOJI="🏷️"; COLOR="violet";    STATE="New Tag" ;;
+            *)                         EMOJI="🔔"; COLOR="grey" ;;
+          esac
+
+          # ===== 3) Header 文案 + 主按钮文案 =====
+          case "$KIND" in
+            PR)   HEADER="$EMOJI $KIND #$NUMBER $STATE" ;;
+            Push) HEADER="$EMOJI $STATE → $BRANCHES" ;;
+            Tag)  HEADER="$EMOJI $STATE: $TITLE" ;;
+            *)    HEADER="$EMOJI $STATE" ;;
+          esac
+          case "$KIND" in
+            PR)   BTN="View PR" ;;
+            Push) BTN="View Diff" ;;
+            Tag)  BTN="View Tag" ;;
+            *)    BTN="View" ;;
+          esac
+
+          # 兜底:按钮 URL/标题不能为空
+          [ -n "$URL" ]   || URL="$REPO_URL"
+          [ -n "$TITLE" ] || TITLE="(no title)"
+
+          # 脚注时间(本地化到上海时区);取不到则省略脚注
+          TS=""
+          if [ -n "${TS_RAW:-}" ]; then
+            TS="$(TZ=Asia/Shanghai date -d "$TS_RAW" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "")"
+          fi
+
+          # ===== 4) 用 python3 构造统一卡片(程序在 env CARD_PY)=====
+          # 把上面算好的展示变量导出给 python3 读取;不可信字段全程只走 env,绝不拼进脚本。
+          export HEADER TITLE AUTHOR URL COLOR BTN BRANCHES COMMENT BODY \
+                 LABELS ASSIGNEES REVIEWER CHANGES FILE WORKFLOW TS
+          PAYLOAD=$(python3 -c "$CARD_PY")
+
+          curl -fsS -X POST "$FEISHU_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD"
